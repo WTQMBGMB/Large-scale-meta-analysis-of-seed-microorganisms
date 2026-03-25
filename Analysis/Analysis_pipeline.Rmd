@@ -1,0 +1,1626 @@
+---
+title: "analysis_pipeline"
+author: "Zilong Wang"
+date: "2026-03-16"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# Data preprocessing
+
+```{r}
+rm(list = ls())
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(vegan)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+dir.create("result")
+# Remove the taxid rows that contain "Eukaryota" (fungi), "Chloroplast" (chloroplasts), and "Mitochondria" (mitochondria).
+sample_taxid_abundance_16s = read.delim("raw/sample_taxid_abundance_16s.txt")
+taxonomy_16s <- read.delim("raw/taxonomy_all16s.txt")
+pattern <- "Eukaryota|Chloroplast|Mitochondria"
+
+taxonomy_cols <- taxonomy_16s[, -1, drop = FALSE]
+matches <- sapply(taxonomy_cols, function(col) {
+  grepl(pattern, col, perl = TRUE) 
+})
+
+matches[is.na(matches)] <- FALSE
+
+# Determine whether there is at least one match in each row (any column contains keywords)）
+has_match <- apply(matches, 1, any) 
+
+# Extract the otuid of the matching line and convert it into a character vector
+non_bac <- as.character(taxonomy_16s$taxid[has_match])
+filtered_taxonomy <- taxonomy_16s[! (taxonomy_16s$taxid %in% non_bac), ]
+write.table(filtered_taxonomy,file = "raw/taxonomy_all16s.txt",sep = "\t", 
+            row.names = FALSE,col.names = TRUE,quote = FALSE,fileEncoding = "UTF-8")
+filtered_table <- sample_taxid_abundance_16s[! (sample_taxid_abundance_16s$taxid %in% non_bac), ]
+write.table(filtered_table,file = "raw/sample_taxid_abundance_16s.txt",sep = "\t", 
+            row.names = FALSE,col.names = TRUE,quote = FALSE,fileEncoding = "UTF-8")
+
+# Remove samples with too few annotations
+sample_taxid_abundance_16s = read.delim("raw/sample_taxid_abundance_16s.txt",row.names = 1)
+metadata_16s <- read.csv("raw/metadata_all16s.csv")
+merged_16s_classified <- sample_taxid_abundance_16s[rownames(sample_taxid_abundance_16s) != "Unassigned", ]
+merged_16s_temp <- merged_16s_classified %>%
+  select(where(~ is.numeric(.) && sum(., na.rm = TRUE) >= 1000))
+pure_list = colnames(merged_16s_temp)
+merged_16s_filter = sample_taxid_abundance_16s[ ,c(pure_list)]
+merged_16s_filter = rownames_to_column(merged_16s_filter,var="taxid")
+metadata_16s_filter = metadata_16s[metadata_16s$SampleID %in% c(pure_list), ]
+write.table(merged_16s_filter,file = "raw/sample_taxid_abundance_16s.txt",sep = "\t", 
+            row.names = FALSE,col.names = TRUE,quote = FALSE,fileEncoding = "UTF-8")
+write.csv(metadata_16s_filter, "raw/metadata_all16s.csv", fileEncoding = "UTF-8", row.names = FALSE)
+```
+
+#Convert the matrix into a 01 matrix
+```{r}
+rm(list = ls())
+library(Hmisc)
+library(psych)
+library(ggClusterNet)
+library(metagenomeSeq)
+library(tibble)
+sample_taxid_abundance_16s = read.delim("raw/sample_taxid_abundance_16s.txt", row.names = 1)
+sample_taxid_abundance_its = read.delim("raw/sample_taxid_abundance_its.txt", row.names = 1)
+sample_taxid_01_16s <- as.data.frame(lapply(sample_taxid_abundance_16s, function(x) ifelse(x > 0, 1, 0)))
+rownames(sample_taxid_01_16s) <- rownames(sample_taxid_abundance_16s)
+sample_taxid_01_16s = rownames_to_column(sample_taxid_01_16s,var = "taxid")
+write.table(sample_taxid_01_16s,file = "sample_taxid_01_16s.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+sample_taxid_01_its <- as.data.frame(lapply(sample_taxid_abundance_its, function(x) ifelse(x > 0, 1, 0)))
+rownames(sample_taxid_01_its) <- rownames(sample_taxid_abundance_its)
+sample_taxid_01_its = rownames_to_column(sample_taxid_01_its,var = "taxid")
+write.table(sample_taxid_01_its,file = "sample_taxid_01_its.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+```
+
+#The proportion of annotable reads in the visualized sequence to the total number of reads
+```{r,fig.height = 5,fig.with = 12}
+rm(list = ls())
+dir.create("result")
+library(ggplot2)
+library(patchwork)
+sample_taxid_abundance_16s = read.delim("raw/sample_taxid_abundance_16s.txt", row.names = 1)
+sample_taxid_abundance_its = read.delim("raw/sample_taxid_abundance_its.txt", row.names = 1)
+# Calculate the annotation ratio ((1 - Unassigned / Total sum of each column))
+unassigned_values <- as.numeric(sample_taxid_abundance_16s[rownames(sample_taxid_abundance_16s) == "Unassigned", ])
+col_totals <- colSums(sample_taxid_abundance_16s)
+annotated_prop <- 1 - (unassigned_values / col_totals)
+plot_data <- data.frame(annotated_proportion = annotated_prop)
+
+# Calculate the basic statistics (mean and standard deviation)
+mean_val <- mean(plot_data$annotated_proportion, na.rm = TRUE)
+sd_val <- sd(plot_data$annotated_proportion, na.rm = TRUE)
+
+
+hist_plot1 <- ggplot(plot_data, aes(x = annotated_proportion)) +
+  geom_histogram(fill = "#DD9273", color = "black", bins = 30, alpha = 0.8) + 
+  xlab("The annotated proportion") +
+  ylab("Counts")+
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+           label = paste0("Mean: ", round(mean_val, 3), "\nSD: ", round(sd_val, 3)),
+           size = 5) +
+  theme_classic() + 
+  theme(
+    legend.position = "top" ,
+    panel.background = element_blank(), 
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5,  
+      margin = margin(b = 10)  
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5,  
+      lineheight = 1.2,  
+      margin = margin(b = 15) 
+    ),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0), 
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"), 
+    legend.title = element_text(size = 14, color = "black"), 
+    legend.text = element_text(size = 14, color = "black"), 
+    plot.margin = margin(t = 10,  
+                         r = 30,  
+                         b = 10,  
+                         l = 10,  
+                         unit = "pt") 
+  )
+
+#its
+unassigned_values <- as.numeric(sample_taxid_abundance_its[rownames(sample_taxid_abundance_its) == "Unassigned", ])
+col_totals <- colSums(sample_taxid_abundance_its)
+annotated_prop <- 1 - (unassigned_values / col_totals)
+plot_data <- data.frame(annotated_proportion = annotated_prop)
+mean_val <- mean(plot_data$annotated_proportion, na.rm = TRUE)
+sd_val <- sd(plot_data$annotated_proportion, na.rm = TRUE)
+hist_plot2 <- ggplot(plot_data, aes(x = annotated_proportion)) +
+  geom_histogram(fill = "#DD9273", color = "black", bins = 30, alpha = 0.8) +
+  xlab("The annotated proportion") +
+  ylab("Counts")+
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+           label = paste0("Mean: ", round(mean_val, 3), "\nSD: ", round(sd_val, 3)),
+           size = 5) +
+  theme_classic() + 
+  theme(
+    legend.position = "top" ,
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5,
+      margin = margin(b = 10) 
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5,  
+      lineheight = 1.2, 
+      margin = margin(b = 15) 
+    ),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"), 
+    legend.title = element_text(size = 14, color = "black"),
+    legend.text = element_text(size = 14, color = "black"), 
+    plot.margin = margin(t = 10,  
+                         r = 30,  
+                         b = 10,  
+                         l = 10, 
+                         unit = "pt")
+  )
+library(ggpubr)
+combined_plot <- ggarrange(hist_plot1, hist_plot2,  
+                           ncol = 2 
+)
+combined_plot
+
+ggsave("result/Annotated_Proportions.pdf",combined_plot,width = 12,height = 5)
+```
+
+#Visualization extraction methods and the proportion of sequencing regions
+```{r,fig.show='animate'}
+rm(list = ls())
+source("Tools.R")
+library(ggplot2)
+library(dplyr)
+library(scales)
+metadata_16s <- read.csv("raw/metadata_all16s.csv")
+metadata_its <- read.csv("raw/metadata_allits.csv")
+# 16s extract_way
+p1 = draw_pie_chart(metadata_16s,"extract_way", label = TRUE, pre = TRUE,"Extract Way")
+p1
+ggsave("result/extact_way_16s.pdf",p1,width = 6,height = 6)
+# 16s Sequencing Region
+p2 = draw_pie_chart(metadata_16s,"region", label = F, pre = TRUE,"Sequencing Region")
+p2
+ggsave("result/Sequencing_Region_16s.pdf",p2,width = 6,height = 4)
+# its extract_way
+p3 = draw_pie_chart(metadata_its,"extract_way", label = TRUE, pre = TRUE,"Extract Way")
+p3
+ggsave("result/extact_way_its.pdf",p3,width = 6,height = 4)
+# its Sequencing Region
+p4 = draw_pie_chart(metadata_its,"region", label = TRUE, pre = TRUE,"Region")
+p4
+ggsave("result/Sequencing_Region_its.pdf",p4,width = 6,height = 4)
+```
+
+# Draw a pcoa diagram based on jaccard distance
+```{r,fig.show='animate'}
+rm(list = ls())
+
+# Load required packages
+library(vegan)
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+library(tibble)
+# Import data
+sample_taxid_01_16s = read.delim("sample_taxid_01_16s.txt", row.names=1)
+sample_taxid_01_its = read.delim("sample_taxid_01_its.txt", row.names=1)
+metadata_16s <- read.csv("raw/metadata_all16s.csv")
+metadata_its <- read.csv("raw/metadata_allits.csv")
+
+# 16S PCoA and PERMANOVA
+jaccard_dist <- vegdist(t(sample_taxid_01_16s), method = "jaccard")
+spe1 = decostand(t(sample_taxid_01_16s), "hel")
+design2 <- column_to_rownames(metadata_16s, "SampleID")
+adonis = adonis2(spe1 ~ Genus, data = design2, permutations = 999, method = "jaccard", by = "margin")
+
+pcoa__16s <- cmdscale(jaccard_dist, k = 2, eig = TRUE)
+pcoa_scores <- as.data.frame(pcoa__16s$points)
+colnames(pcoa_scores) <- c("PCoA1", "PCoA2")
+pcoa_scores$SampleID <- rownames(pcoa_scores)
+pcoa_data_16s <- merge(pcoa_scores, metadata_16s, by = "SampleID", all.x = TRUE)
+
+# Calculate variance explained by the first two axes
+eigenvalues <- pcoa__16s$eig
+variance_explained <- eigenvalues / sum(eigenvalues) * 100
+pc1_var_16s <- round(variance_explained[1], 2)
+pc2_var_16s <- round(variance_explained[2], 2)
+
+# ITS PCoA and PERMANOVA
+otutab_filtered_its <- sample_taxid_01_its[rowSums(sample_taxid_01_its) > 0, ]
+jaccard_dist <- vegdist(t(sample_taxid_01_its), method = "jaccard")
+spe2 = decostand(t(sample_taxid_01_its), "hel")
+design3 <- column_to_rownames(metadata_its, "SampleID")
+adonis3 = adonis2(spe2 ~ Genus, data = design3, permutations = 999, method = "jaccard", by = "margin")
+
+pcoa__its <- cmdscale(jaccard_dist, k = 2, eig = TRUE)
+pcoa_scores <- as.data.frame(pcoa__its$points)
+colnames(pcoa_scores) <- c("PCoA1", "PCoA2")
+pcoa_scores$SampleID <- rownames(pcoa_scores)
+pcoa_data_its <- merge(pcoa_scores, metadata_its, by = "SampleID", all.x = TRUE)
+
+eigenvalues <- pcoa__its$eig
+variance_explained <- eigenvalues / sum(eigenvalues) * 100
+pc1_var_its <- round(variance_explained[1], 2)
+pc2_var_its <- round(variance_explained[2], 2)
+
+# Create a unified color palette for plant genera
+colorlist <- c("#C29D59", "#9B443B", "#7B6D4A", "#4B5B74", "#C6803A", "#CB4047",
+               "#CD5176", "#A08A6D", "#816148", "#CDB97E", "#A971A0", "#3E4069", "#CDA59D",
+               "#B24057", "#BC9D88", "#886349", "#B07E9F", "#726F8E", "#A17D5D",
+               "#875215", "#C1C19D", "#E4A644", "#E0CF5B", "#826859", "#E9BDA0", "#E5B8A1",
+               "#E7D6C2", "#BDB79F", "#B99FC6", "#D69DA4", "#C1D2E2", "#6D5249",
+               "#FDE0E4", "#465069", "#B37C75", "#B19E8F", "#6C7612", "#624733", "#D56847",
+               "#BC9F77", "#A1997B", "#CB3F48", "#A94B32", "#A54B43", "#8A926B",
+               "#427370", "#A18F81", "#4E95C5", "#D5ABBF", "#E0C8B0", "#8D6A4A", "#67361C",
+               "#F7E09B", "#9C7C52", "#CB9D7B", "#B89052", "#3C2913", "#A7785B",
+               "#DDD2BE", "#E8EEBC", "#F6DC54", "#B2620C", "#CA9C4F", "#509C82", "#517D7E",
+               "#8F6C4B", "#CB7E3A", "#808DAA", "#C5A376", "#DE7117", "#9EB395")
+
+plant_genus = unique(c(c(pcoa_data_16s$Genus), c(pcoa_data_its$Genus)))
+plant_genus_color = character()
+i = 1
+for (p in plant_genus) {
+  plant_genus_color[p] = colorlist[i]
+  i = i + 1
+}
+
+# Plot 16S PCoA
+p1 <- ggplot(pcoa_data_16s, aes(x = PCoA1, y = PCoA2, color = Genus)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(x = paste0("PCoA1 (", pc1_var_16s, "%)"),
+       y = paste0("PCoA2 (", pc2_var_16s, "%)"),
+       color = "Plant Genus",
+       title = "16S Samples",
+       subtitle = paste("R2=", round((adonis$R2[1]), 3), "p=", adonis$`Pr(>F)`[1])) +
+  scale_color_manual(values = plant_genus_color) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5,
+      margin = margin(b = 10)
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5,
+      lineheight = 1.2,
+      margin = margin(b = 15)
+    ),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14, color = "black", face = "bold"),
+    legend.text = element_text(size = 14, color = "black"),
+    plot.margin = margin(t = 10,
+                         r = 30,
+                         b = 10,
+                         l = 10,
+                         unit = "pt")
+  )
+
+# Plot ITS PCoA
+p2 <- ggplot(pcoa_data_its, aes(x = PCoA1, y = PCoA2, color = Genus)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(x = paste0("PCoA1 (", pc1_var_its, "%)"),
+       y = paste0("PCoA2 (", pc2_var_its, "%)"),
+       color = "Plant Genus",
+       title = "ITS Samples",
+       subtitle = paste("R2=", round((adonis3$R2[1]), 3), "p=", adonis3$`Pr(>F)`[1])) +
+  scale_color_manual(values = plant_genus_color) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5,
+      margin = margin(b = 10)
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5,
+      lineheight = 1.2,
+      margin = margin(b = 15)
+    ),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14, color = "black", face = "bold"),
+    legend.text = element_text(size = 14, color = "black"),
+    plot.margin = margin(t = 10,
+                         r = 30,
+                         b = 10,
+                         l = 10,
+                         unit = "pt")
+  )
+
+# Combine plots with a shared legend
+combined_plot <- ggarrange(p1, p2,
+                           ncol = 2,
+                           common.legend = TRUE,
+                           legend = "right")
+
+combined_plot
+ggsave("result/16s_its_PCoA__jaccard.pdf", plot = combined_plot, width = 15, height = 5.5)
+
+```
+
+# Use PERMANOVA and VPA analyses to test the contribution of host factors to the community results
+```{r,fig.show='animate'}
+rm(list = ls())
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+sample_taxid_01_16s = read.delim("sample_taxid_01_16s.txt", row.names=1)
+sample_taxid_01_its = read.delim("sample_taxid_01_its.txt", row.names=1)
+metadata_16s <- read.csv("raw/metadata_all16s.csv")
+metadata_its <- read.csv("raw/metadata_allits.csv")
+spe1=decostand(t(sample_taxid_01_16s),"hel")
+design2 <-column_to_rownames(metadata_16s,"SampleID")
+spe2=decostand(t(sample_taxid_01_its),"hel")
+design3 <-column_to_rownames(metadata_its,"SampleID")
+# vpa
+jaccard_dist_16s <- vegdist(t(sample_taxid_01_16s), method = "jaccard")
+jaccard_dist_its <- vegdist(t(sample_taxid_01_its), method = "jaccard")
+
+vpa_result_16s <- varpart(jaccard_dist_16s, 
+                      ~ Genus, 
+                      ~ extract_way, 
+                      ~ Country, 
+                      data = design2)
+pdf("result/vpa_plot_16s.pdf", width = 7, height = 6) 
+plot(vpa_result_16s, 
+     digits = 2, 
+     Xnames = c("Genus", "Extract_way", "Country"), 
+     bg = c("tomato", "skyblue", "lightgreen"))
+dev.off()
+
+
+vpa_result_its <- varpart(jaccard_dist_its, 
+                          ~ Genus, 
+                          ~ extract_way, 
+                          ~ Country, 
+                          data = design3)
+pdf("result/vpa_plot_its.pdf", width = 7, height = 6)
+plot(vpa_result_its, 
+     digits = 2, 
+     Xnames = c("Genus", "Extract_way", "Country"), 
+     bg = c("tomato", "skyblue", "lightgreen"))
+dev.off()
+
+# PERMANOVA
+
+prepare_data <- function(df, label) {
+  df %>%
+    as.data.frame() %>%
+    mutate(Factor = rownames(.)) %>%
+    filter(Factor %in% c("Genus", "Country", "extract_way")) %>%
+    mutate(Community = label) %>%
+    select(Community, Factor, R2)
+}
+
+
+adonis_test_16s = adonis2(spe1 ~ Genus + extract_way + Country,data =design2,permutations = 999,method="jaccard", by="margin",parallel = 8)
+adonis_test_its = adonis2(spe2 ~ Genus + extract_way + Country,data =design3,permutations = 999,method="jaccard", by="margin",parallel = 8)
+plot_df_16s <- prepare_data(adonis_test_16s, "16S (Bacteria)")
+plot_df_its <- prepare_data(adonis_test_its, "ITS (Fungi)")
+
+
+final_plot_df <- rbind(plot_df_16s, plot_df_its)
+final_plot_df$R2_percent <- final_plot_df$R2 * 100
+
+
+PERMANOVA = ggplot(final_plot_df, aes(x = Factor, y = R2_percent, fill = Community)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = sprintf("%.2f%%", R2_percent)), 
+            position = position_dodge(width = 0.8), 
+            vjust = -0.5, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c("16S (Bacteria)" = "#4E79A7", "ITS (Fungi)" = "#F28E2B")) +
+  labs(title = "Comparison of Community Variation Explained (R²)",
+       x = "Explanatory Factors",
+       y = "Variance Explained (R² %)",
+       fill = "Community Type") +
+  scale_y_continuous(limits = c(0, max(final_plot_df$R2_percent) + 2)) +
+  theme_bw() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey30"),
+    axis.text = element_text(size = 11, color = "black"),
+    legend.position = "top"
+  )
+ggsave("result/PERMANOVA.pdf",plot = PERMANOVA, width = 8, height = 7)
+```
+
+
+
+# Draw a scatter plot showing the relationship between the number of plant genera and the number of microbial species
+```{r,fig.show='animate'}
+rm(list = ls())
+source("Tools.R")
+library(tidyr)
+library(tidyverse)
+sample_taxid_01_16s = read.delim("sample_taxid_01_16s.txt", row.names=1)
+sample_taxid_01_its = read.delim("sample_taxid_01_its.txt", row.names=1)
+metadata_16s <- read.csv("raw/metadata_all16s.csv")
+metadata_its <- read.csv("raw/metadata_allits.csv")
+
+column_sums <- colSums(sample_taxid_01_16s)
+result_df <- data.frame(
+  SampleID = names(column_sums),
+  sum = column_sums
+)
+rownames(result_df) <- NULL
+genus_tax_count_16s = merge(metadata_16s, result_df, by = "SampleID")
+genus_tax_count_16s$log10 = log10(genus_tax_count_16s$sum + 1)
+
+# Calculate mean richness for each plant genus
+mean_richness_16s = genus_tax_count_16s %>%
+  group_by(Genus) %>%
+  summarise(mean_richness = mean(sum, na.rm = TRUE)) %>%
+  arrange(desc(mean_richness))
+
+column_sums <- colSums(sample_taxid_01_its)
+result_df <- data.frame(
+  SampleID = names(column_sums),
+  sum = column_sums
+)
+rownames(result_df) <- NULL
+genus_tax_count_its = merge(metadata_its, result_df, by = "SampleID")
+genus_tax_count_its$log10 = log10(genus_tax_count_its$sum + 1)
+
+# Calculate mean richness for each plant genus
+mean_richness_its = genus_tax_count_its %>%
+  group_by(Genus) %>%
+  summarise(mean_richness = mean(sum, na.rm = TRUE)) %>%
+  arrange(desc(mean_richness))
+
+# Generate boxplots for 16S and ITS richness
+genus_count_16s = tukey_boxplot(genus_tax_count_16s, "Genus", "log10", "#427370", "#4B5B74", 0.2, FALSE, "Plant Genus", "Richness (log10)", "The number of microbial species in the seeds of each genus of plants(16S Samples)")
+genus_count_16s[[2]]
+ggsave("result/genus_tax_count_16s.pdf", plot = genus_count_16s[[2]], width = 16, height = 6)
+
+genus_count_its = tukey_boxplot(genus_tax_count_its, "Genus", "log10", "#427370", "#4B5B74", 0.2, FALSE, "Plant Genus", "Richness (log10)", "The number of microbial species in the seeds of each genus of plants(ITS Samples)")
+genus_count_its[[2]]
+ggsave("result/genus_tax_count_its.pdf", plot = genus_count_its[[2]], width = 16, height = 6)
+```
+
+#Merge the functional prediction results with the taxonomy table
+
+```{r}
+rm(list = ls())
+taxonomy_16s <- read.delim("raw/taxonomy_all16s.txt")
+taxonomy_its <- read.delim("raw/taxonomy_allits.txt")
+picrust2_result = read.delim("raw/picrust2_ko_richness.txt")
+bugbase_result= read.delim("raw/bugbase_result.txt")
+funguild_result = read.delim("raw/funguild_result.txt")
+taxonomy_16s_final = merge(taxonomy_16s,picrust2_result,by = "taxid", all.x = TRUE)
+taxonomy_16s_final = merge(taxonomy_16s_final,bugbase_result,by = "taxid", all.x = TRUE)
+taxonomy_16s_final = taxonomy_16s_final %>%
+  mutate(Aerobic_type = ifelse(Aerobic=="TRUE","Aerobic",ifelse(Anaerobic=="TRUE","Anaerobic",ifelse(Facultatively_Anaerobic=="TRUE","Facultatively_Anaerobic","Unknown")))) %>%
+  mutate(Gram_type = ifelse(Gram_Positive=="TRUE","Positive",ifelse(Gram_Negative=="TRUE","Negative","Unknown")))%>%
+  replace(is.na(.), "Unknown")
+
+write.table(taxonomy_16s_final,file = "taxonomy_16s_final.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+taxonomy_its_final = merge(taxonomy_its,funguild_result,by = "taxid", all.x = TRUE)%>%replace(is.na(.), "Unknown")
+taxonomy_its_final = taxonomy_its_final%>%replace(is.na(.), "Unknown")
+write.table(taxonomy_its_final,file = "taxonomy_its_final.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+```
+
+# Identify General Microbiome
+## Create the "PG–TAXID" table
+```{r}
+rm(list = ls())
+source("Tools.R")
+library(dplyr)
+library(tibble)
+library(vegan)
+# import data
+sample_taxid_01_16s = read.delim("sample_taxid_01_16s.txt", row.names=1)
+sample_taxid_01_its = read.delim("sample_taxid_01_its.txt", row.names=1)
+metadata_16s <- read.csv("raw/metadata_all16s.csv")
+metadata_its <- read.csv("raw/metadata_allits.csv")
+taxonomy_16s <- read.delim("raw/taxonomy_all16s.txt")
+taxonomy_its <- read.delim("raw/taxonomy_allits.txt")
+
+Genus_list = unique(metadata_16s$Genus)
+PG_taxid_16s = taxonomy_16s[ ,c("taxid"), drop = FALSE]
+for (i in Genus_list){
+  message(paste0("processing",i))
+  tempdf=sample_taxid_01_16s[ ,metadata_16s[metadata_16s$Genus==i, ]$SampleID,drop = FALSE]
+  if (ncol(tempdf)>=10){
+    result = classify_generalist(tempdf,i,1000)
+  }else if(ncol(tempdf)==1){
+    result <- rownames_to_column(tempdf,"taxid")
+    colnames(result)[2] <- i
+  }else{
+    result <- data.frame(
+      taxid = rownames(tempdf),
+      Presence = as.integer(apply(tempdf, 1, function(row) any(row != 0)))
+    )
+    colnames(result)[2] <- i
+  }
+  PG_taxid_16s = merge(PG_taxid_16s,result,by= "taxid")
+}
+write.table(PG_taxid_16s,file = "PG_taxid_16s.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+Genus_list = unique(metadata_its$Genus)
+PG_taxid_its = taxonomy_its[ ,c("taxid"), drop = FALSE]
+for (i in Genus_list){
+  tempdf=sample_taxid_01_its[ ,metadata_its[metadata_its$Genus==i, ]$SampleID,drop = FALSE]
+  if (ncol(tempdf)>=10){
+    result = classify_generalist(tempdf,i,1000)
+  }else if(ncol(tempdf)==1){
+    result <- rownames_to_column(tempdf,"taxid")
+    colnames(result)[2] <- i
+  }else{
+    result <- data.frame(
+      taxid = rownames(tempdf),
+      Presence = as.integer(apply(tempdf, 1, function(row) any(row != 0)))
+    )
+    colnames(result)[2] <- i
+  }
+  PG_taxid_its = merge(PG_taxid_its,result,by= "taxid")
+}
+write.table(PG_taxid_its,file = "PG_taxid_its.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+```
+
+## Calculate the host corresponding to the specialist
+```{r}
+rm(list = ls())
+library(tidyr)
+library(tibble)
+PG_taxid_16s = read.delim("PG_taxid_16s.txt")
+PG_taxid_its = read.delim("PG_taxid_its.txt")
+taxonomy_16s_final = read.delim("taxonomy_16s_final.txt")
+taxonomy_its_final = read.delim("taxonomy_its_final.txt")
+
+taxonomy_16s_final = merge(
+  taxonomy_16s_final,
+  data.frame(taxid = PG_taxid_16s$taxid, prevalence = rowSums(PG_taxid_16s[, -1])),
+  by = "taxid"
+)
+taxonomy_its_final = merge(
+  taxonomy_its_final,
+  data.frame(taxid = PG_taxid_its$taxid, prevalence = rowSums(PG_taxid_its[, -1])),
+  by = "taxid"
+)
+
+# Identify taxa that occur in only one sample and record the corresponding sample name
+occurrence_count <- rowSums(PG_taxid_16s[, -1])
+specialist_indices <- which(occurrence_count == 1)
+specialist_samples <- rep(NA, nrow(PG_taxid_16s))
+
+for (i in specialist_indices) {
+  row_data <- PG_taxid_16s[i, -1]
+  sample_index <- which(row_data == 1)
+  specialist_samples[i] <- names(PG_taxid_16s[, -1])[sample_index]
+}
+
+specialist_plant <- data.frame(
+  taxid = PG_taxid_16s[, 1],
+  specialist_plant = specialist_samples,
+  stringsAsFactors = FALSE
+)
+
+taxonomy_16s_final = merge(taxonomy_16s_final, specialist_plant, by.x = "taxid", by.y = "taxid")
+
+# Identify taxa that occur in only one sample and record the corresponding sample name
+occurrence_count <- rowSums(PG_taxid_its[, -1])
+specialist_indices <- which(occurrence_count == 1)
+specialist_samples <- rep(NA, nrow(PG_taxid_its))
+
+for (i in specialist_indices) {
+  row_data <- PG_taxid_its[i, -1]
+  sample_index <- which(row_data == 1)
+  specialist_samples[i] <- names(PG_taxid_its[, -1])[sample_index]
+}
+
+specialist_plant <- data.frame(
+  taxid = PG_taxid_its[, 1],
+  specialist_plant = specialist_samples,
+  stringsAsFactors = FALSE
+)
+
+taxonomy_its_final = merge(taxonomy_its_final, specialist_plant, by.x = "taxid", by.y = "taxid")
+
+write.table(taxonomy_16s_final, file = "taxonomy_16s_final.txt", quote = FALSE, sep = "\t", row.names = FALSE, fileEncoding = "UTF-8")
+write.table(taxonomy_its_final, file = "taxonomy_its_final.txt", quote = FALSE, sep = "\t", row.names = FALSE, fileEncoding = "UTF-8")
+```
+
+##Create the PO_MG table
+```{r}
+rm(list = ls())
+library(tibble)
+library(tidyr)
+PG_taxid_16s = read.delim("PG_taxid_16s.txt")
+PG_taxid_its = read.delim("PG_taxid_its.txt")
+taxonomy_16s_final = read.delim("taxonomy_16s_final.txt")
+taxonomy_its_final = read.delim("taxonomy_its_final.txt")
+metadata_16s <- read.csv("raw/metadata_all16s.csv")
+metadata_its <- read.csv("raw/metadata_allits.csv")
+#16s
+PG_MG_01_16s = merge(taxonomy_16s_final[ ,c("taxid","Genus")],PG_taxid_16s,by = "taxid")[ ,-1] %>%
+  group_by(Genus) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  column_to_rownames(var = "Genus")
+PG_MG_01_16s[PG_MG_01_16s != 0] <- 1
+PG_MG_01_16s = as.data.frame(t(PG_MG_01_16s))
+
+metadata_16s_classify = unique(metadata_16s[ ,c("Genus","Phylum","Class","Order","Family","pathway")])
+freq_table <- table(metadata_16s$Order) 
+sorted_freq <- as.data.frame(sort(freq_table, decreasing = TRUE) )
+desort_colname <- as.character(sorted_freq[sorted_freq$Freq >= 10, ]$Var1) 
+
+PO_MG_01_16s  = merge(metadata_16s_classify[ ,c("Genus","Order")],PG_MG_01_16s,by.x = "Genus",by.y = "row.names")[ ,-1] %>%
+  group_by(Order) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  column_to_rownames(var = "Order")
+PO_MG_01_16s [PO_MG_01_16s  != 0] <- 1
+PO_MG_01_16s  = PO_MG_01_16s [desort_colname, ]
+write.table(rownames_to_column(PO_MG_01_16s,"Order"),file = "PO_MG_01_16s.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+#its
+PG_MG_01_its = merge(taxonomy_its_final[ ,c("taxid","Genus")],PG_taxid_its,by = "taxid")[ ,-1] %>%
+  group_by(Genus) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  column_to_rownames(var = "Genus")
+PG_MG_01_its[PG_MG_01_its != 0] <- 1
+PG_MG_01_its = as.data.frame(t(PG_MG_01_its))
+
+metadata_its_classify = unique(metadata_its[ ,c("Genus","Phylum","Class","Order","Family","pathway")])
+freq_table <- table(metadata_its$Order) 
+sorted_freq <- as.data.frame(sort(freq_table, decreasing = TRUE) )
+desort_colname <- as.character(sorted_freq[sorted_freq$Freq >= 10, ]$Var1) 
+
+PO_MG_01_its  = merge(metadata_its_classify[ ,c("Genus","Order")],PG_MG_01_its,by.x = "Genus",by.y = "row.names")[ ,-1] %>%
+  group_by(Order) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  column_to_rownames(var = "Order")
+PO_MG_01_its [PO_MG_01_its  != 0] <- 1
+PO_MG_01_its  = PO_MG_01_its [desort_colname, ]
+write.table(rownames_to_column(PO_MG_01_its,"Order"),file = "PO_MG_01_its.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+```
+
+##Draw the petal diagram and search for General Microbiome
+```{r,fig.show='animate'}
+rm(list = ls())
+library(tibble)
+library(tidyr)
+source("Tools.R")
+PO_MG_01_16s = read.delim("PO_MG_01_16s.txt",row.names = 1)
+PO_MG_01_its = read.delim("PO_MG_01_its.txt",row.names = 1)
+# Based on data, calculate the unique and coexisting quantities
+n_env <- nrow(PO_MG_01_16s)
+env_names <- rownames(PO_MG_01_16s)
+microbe_names <- colnames(PO_MG_01_16s)
+# Calculate the total number of coexisting microorganisms (those present in all environments, meaning all columns are filled with 1s)
+core_microbes_16s <- microbe_names[colSums(PO_MG_01_16s) == n_env]
+core_microbes_16s <- core_microbes_16s[core_microbes_16s != "Unassigned"]
+core_microbes_16s <- core_microbes_16s[core_microbes_16s != "Incertae Sedis"]
+writeLines(core_microbes_16s, "core_microbes_16s.txt")
+core_microbes_16s <- readLines("core_microbes_16s.txt")
+core <- length(core_microbes_16s)
+# Calculate the number of unique microorganisms for each environment (those that exist only in that environment, and are all zero elsewhere)
+num <- numeric(n_env)
+for (i in 1:n_env) {
+  other_sums <- colSums(PO_MG_01_16s[-i, , drop = FALSE])
+  unique_to_i <- sum(PO_MG_01_16s[i, ] == 1 & other_sums == 0)
+  num[i] <- unique_to_i
+}
+
+sample <- env_names
+n_colors <- length(sample)
+ellipse_col <- c("#A23F25","#3E4069","#517D7E","#CA820A","#C1D2E2","#F7E09B","#808DAA","#E5A984","#552379","#B24057","#A49BC6")
+
+flower_plot(
+  sample = sample,
+  num = num,
+  core = core,
+  ellipse_col = ellipse_col,
+  alpha = 0.5,  
+  start = 90,
+  a = 0.6, 
+  b = 2,   
+  r = 1,  
+  nameSize = 1.2,
+  numSize = 1.2,
+  coreSize = 1.2
+)
+
+
+
+n_env <- nrow(PO_MG_01_its )
+env_names <- rownames(PO_MG_01_its )
+microbe_names <- colnames(PO_MG_01_its )
+core_microbes_its <- microbe_names[colSums(PO_MG_01_its ) == n_env]
+core_microbes_its <- core_microbes_its[core_microbes_its != "Unassigned"]
+core_microbes_its <- core_microbes_its[core_microbes_its != "Incertae Sedis"]
+writeLines(core_microbes_its, "core_microbes_its.txt")
+core_microbes_its <- readLines("core_microbes_its.txt")
+core <- length(core_microbes_its)
+num <- numeric(n_env)
+for (i in 1:n_env) {
+  other_sums <- colSums(PO_MG_01_its [-i, , drop = FALSE])
+  unique_to_i <- sum(PO_MG_01_its [i, ] == 1 & other_sums == 0)
+  num[i] <- unique_to_i
+}
+sample <- env_names
+n_colors <- length(sample)
+ellipse_col <- c("#A23F25","#3E4069","#517D7E","#CA820A","#C1D2E2","#F7E09B","#808DAA","#E5A984")
+
+flower_plot(
+  sample = sample,
+  num = num,
+  core = core,
+  ellipse_col = ellipse_col,
+  alpha = 0.5,
+  start = 90,
+  a = 0.6, 
+  b = 2,
+  r = 1, 
+  nameSize = 0.9,
+  numSize = 0.8,
+  coreSize = 1.2
+)
+
+```
+
+## Draw a bar chart showing the integrated prevalence of the core microbial genera
+```{r,fig.show='animate'}
+rm(list = ls())
+library(tibble)
+library(tidyr)
+PG_taxid_16s = read.delim("PG_taxid_16s.txt")
+PG_taxid_its = read.delim("PG_taxid_its.txt")
+taxonomy_16s_final = read.delim("taxonomy_16s_final.txt")
+taxonomy_its_final = read.delim("taxonomy_its_final.txt")
+core_microbes_16s <- readLines("core_microbes_16s.txt")
+core_microbes_its <- readLines("core_microbes_its.txt")
+
+
+PG_MG_sum_16s = merge(taxonomy_16s_final[ ,c("taxid","Genus")],PG_taxid_16s,by = "taxid")[ ,-1] %>%
+  group_by(Genus) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  column_to_rownames(var = "Genus")
+PG_MG_sum_16s[PG_MG_sum_16s != 0] <- 1
+PG_MG_sum_16s$sum = rowSums(PG_MG_sum_16s)
+write.table(rownames_to_column(PG_MG_sum_16s,"PG"),file = "PG_MG_sum_16s.txt",sep = "\t", 
+            row.names = FALSE,col.names = TRUE,quote = FALSE,fileEncoding = "UTF-8")
+PG_MG_sum_16s <- PG_MG_sum_16s[, c("sum", setdiff(names(PG_MG_sum_16s), "sum"))]
+df_sorted_16s <- PG_MG_sum_16s[order(PG_MG_sum_16s$sum, decreasing = TRUE), ]
+df_sorted_16s = df_sorted_16s[core_microbes_16s,]
+rownames(df_sorted_16s)[which(rownames(df_sorted_16s) == "Burkholderia-Caballeronia-Paraburkholderia")] <- "Burkholderia"
+# 绘制柱状图
+library(ggplot2)
+ggplot(df_sorted_16s, aes(x = reorder(rownames(df_sorted_16s), -sum), y = sum)) +
+  geom_col(aes(fill = sum)) + 
+  scale_fill_gradient(low = "#93CEDF", high = "#E4A644") + 
+  geom_text(aes(label = sum), vjust = -0.5, size = 4) +  
+  labs(x = "Core Bacterial Genus", y = "Merged Prevalence",fill = "Merged\nPrevalence") +
+  theme_classic() + 
+  coord_cartesian(ylim = c(20, NA))+
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5,  
+      margin = margin(b = 10)  
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5, 
+      lineheight = 1.2,  
+      margin = margin(b = 15)  
+    ),
+    axis.text.x = element_text(size = 14, color = "black", angle = -45, hjust = 0, vjust = 1),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0), 
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14, color = "black"), 
+    legend.text = element_text(size = 12, color = "black"), 
+    plot.margin = margin(t = 10,
+                         r = 10,  
+                         b = 10,  
+                         l = 10,  
+                         unit = "pt")
+  )
+ggsave("result/Merged_Prevalence_16s.pdf",width = 10,height = 7.5)
+
+
+PG_MG_sum_its = merge(taxonomy_its_final[ ,c("taxid","Genus")],PG_taxid_its,by = "taxid")[ ,-1] %>%
+  group_by(Genus) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  column_to_rownames(var = "Genus")
+PG_MG_sum_its[PG_MG_sum_its != 0] <- 1
+PG_MG_sum_its$sum = rowSums(PG_MG_sum_its)
+write.table(rownames_to_column(PG_MG_sum_its,"PG"),file = "PG_MG_sum_its.txt",sep = "\t", 
+            row.names = FALSE,col.names = TRUE,quote = FALSE,fileEncoding = "UTF-8")
+PG_MG_sum_its <- PG_MG_sum_its[, c("sum", setdiff(names(PG_MG_sum_its), "sum"))]
+df_sorted_its <- PG_MG_sum_its[order(PG_MG_sum_its$sum, decreasing = TRUE), ]
+df_sorted_its = df_sorted_its[core_microbes_its,]
+
+ggplot(df_sorted_its, aes(x = reorder(rownames(df_sorted_its), -sum), y = sum)) +
+  geom_col(aes(fill = sum)) +  
+  scale_fill_gradient(low = "#93CEDF", high = "#E4A644") +  
+  geom_text(aes(label = sum), vjust = -0.5, size = 4) +  
+  labs(x = "TOP 40 Bacterial Genus", y = "Merged Prevalence",fill = "Merged\nPrevalence") +
+  theme_classic() + 
+  coord_cartesian(ylim = c(20, NA))+
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5,  
+      margin = margin(b = 10)  
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5, 
+      lineheight = 1.2,  
+      margin = margin(b = 15)  
+    ),
+    axis.text.x = element_text(size = 14, color = "black", angle = -45, hjust = 0, vjust = 1),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0), 
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14, color = "black"), 
+    legend.text = element_text(size = 12, color = "black"), 
+    plot.margin = margin(t = 10,
+                         r = 10,  
+                         b = 10,  
+                         l = 10,  
+                         unit = "pt")
+  )
+ggsave("result/Merged_Prevalence_its.pdf",width = 8,height = 7.5)
+```
+
+
+
+
+## Draw the General Genus microbial evolutionary tree
+### The detailed process of constructing the evolutionary tree and preparing the tree file has been omitted here.
+### All the files for constructing the evolutionary tree are located in the "General_tree_16s" and "General_tree_its" folders.
+### Use these files to draw the evolutionary tree on the itol website.
+
+
+
+#Trait shifts with prevalence
+#16S samples
+```{r}
+rm(list = ls())
+source("Tools.R")
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(tidyr)
+library(reshape2)
+library(forcats)
+taxonomy_16s_final = read.delim("taxonomy_16s_final.txt")
+#The relationship between the taxonomic-level species composition and prevalence of the 16s sample
+prevalence_Class_16s = taxonomy_16s_final[ ,c("prevalence","Class")]
+prevalence_Class_16s[prevalence_Class_16s$prevalence >= 20,]$prevalence = 20
+
+make_mutibar(datain = prevalence_Class_16s,
+             out_dir = "result/Class_levels_change_16s.pdf",
+             x_name = "prevalence",
+             y_name = "Proportion of Taxid",
+             legend_name = "Class",
+             limit_num = 10,
+             width = 15,
+             height = 7,
+             other_list = c("Unassigned","Incertae Sedis"),
+             colorlist = c("#FCB366", "#FE816F", "#90D7C7","#93BCD0", "#AF3F4F", 
+                           "#F3BB34", "#F8AD9A", "#5163B5", "#613767", "#56B394",
+                           "#DC6D73", "#B2B896", "#E97DAE","#FB7A64","#EDCE35", 
+                           "#E5C28C", "#CA8BB6", "#1A6C92", "#EAB46E", "#8CC3BD", 
+                           "#4E56AB","#0FBFBC", "#E9A564", "#ADD565", "#ADADAD", 
+                           "#8F9EC5", "#6C77B5", "#138A8E", "#4B9D77", "#8E60A8")
+             )
+Class_test = Calculate_correlation(prevalence_Class_16s,"prevalence","Class")
+class_prop = as.data.frame(table(prevalence_Class_16s$Class))
+main_class = class_prop$Var1[class_prop$Freq>200]
+Class_test = Class_test[Class_test$Variable%in%main_class,]
+print(Class_test)
+#----------------------------------------------------------------------
+
+#The relationship between the aerobic/anaerobic conditions of the 16s samples and the prevalence rate
+prevalence_Aerobic_type_16s = taxonomy_16s_final[ ,c("prevalence","Aerobic_type")]
+prevalence_Aerobic_type_16s <- prevalence_Aerobic_type_16s %>%
+  replace(is.na(.), "Unknown")
+prevalence_Aerobic_type_16s[prevalence_Aerobic_type_16s$prevalence >= 20,]$prevalence = 20
+make_mutibar(datain = prevalence_Aerobic_type_16s,
+             out_dir = "result/prevalence_Aerobic_type_change_16s.pdf",
+             x_name = "prevalence",
+             y_name = "Proportion of Taxid",
+             legend_name = "Aerobic_type",
+             limit_num = 10,
+             width = 10,
+             height = 4,
+             other_list = c("Unassigned","Incertae Sedis","Unknown"),
+             colorlist = c("#99C2C8","#D4693F","#E4A644","#eeeeee")
+)
+Aerobic_type_test = Calculate_correlation(prevalence_Aerobic_type_16s,"prevalence","Aerobic_type")
+print(Aerobic_type_test)
+#--------------------------------------------------------------------------
+
+
+#The relationship between the biofilm-forming potential of 16s samples and their prevalence rate
+prevalence_Forms_Biofilms_16s = taxonomy_16s_final[ ,c("prevalence","Forms_Biofilms")]
+prevalence_Forms_Biofilms_16s <- prevalence_Forms_Biofilms_16s %>%
+  replace(is.na(.), "Unknown")
+prevalence_Forms_Biofilms_16s[prevalence_Forms_Biofilms_16s$prevalence >= 20,]$prevalence = 20
+make_mutibar(datain = prevalence_Forms_Biofilms_16s,
+             out_dir = "result/prevalence_Forms_Biofilms_change_16s.pdf",
+             x_name = "prevalence",
+             y_name = "Proportion of Taxid",
+             legend_name = "Forms_Biofilms",
+             limit_num = 10,
+             width = 10,
+             height = 4,
+             other_list = c("Unassigned","Incertae Sedis","Unknown"),
+             colorlist = c("#846992","#E8C2D9","#eeeeee")
+)
+Forms_Biofilms_test = Calculate_correlation(prevalence_Forms_Biofilms_16s,"prevalence","Forms_Biofilms")
+print(Forms_Biofilms_test)
+#--------------------------------------------------------------------------------
+
+
+
+#The relationship between the Gram-positive and Gram-negative properties of the 16s samples and their prevalence rates
+prevalence_Gram_type_16s = taxonomy_16s_final[ ,c("prevalence","Gram_type")]
+prevalence_Gram_type_16s <- prevalence_Gram_type_16s %>%
+  replace(is.na(.), "Unknown")
+prevalence_Gram_type_16s[prevalence_Gram_type_16s$prevalence >= 20,]$prevalence = 20
+make_mutibar(datain = prevalence_Gram_type_16s,
+             out_dir = "result/prevalence_Gram_type_change_16s.pdf",
+             x_name = "prevalence",
+             y_name = "Proportion of Taxid",
+             legend_name = "Gram_type",
+             limit_num = 10,
+             width = 10,
+             height = 4,
+             other_list = c("Unassigned","Incertae Sedis","Unknown"),
+             colorlist = c("#4B5B74","#A1B1CB","#eeeeee")
+)
+Gram_type_test = Calculate_correlation(prevalence_Gram_type_16s,"prevalence","Gram_type")
+print(Gram_type_test)
+```
+
+## As popularity increases, the changes in genetic diversity occur.
+```{r,fig.show='animate'}
+rm(list = ls())
+
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+
+taxonomy_16s_final <- read.delim("taxonomy_16s_final.txt")
+
+df_ko_prevalance <- taxonomy_16s_final[, c("prevalence", "KO_richness")]
+df_ko_prevalance <- df_ko_prevalance[df_ko_prevalance$KO_richness != "Unknown", ]
+df_ko_prevalance$KO_richness <- as.numeric(df_ko_prevalance$KO_richness)
+
+df_summary <- df_ko_prevalance %>%
+  group_by(prevalence) %>%
+  summarise(
+    KO_richness_max = max(KO_richness, na.rm = TRUE),
+    KO_richness_min = min(KO_richness, na.rm = TRUE)
+  )
+
+lm_model <- lm(KO_richness_min ~ prevalence, data = df_summary)
+
+# Extract equation and statistics for annotation
+lm_eq     <- paste0("y = ", round(coef(lm_model)[1], 2), " + ", round(coef(lm_model)[2], 2), "x")
+r_squared <- paste0("R² = ", round(summary(lm_model)$r.squared, 4))
+p_value   <- summary(lm_model)$coefficients["prevalence", "Pr(>|t|)"]
+p_value_text <- paste0("P = ", signif(p_value, 3))
+
+final_plot <- ggplot() +
+  # Range ribbon (min–max per prevalence bin)
+  geom_ribbon(data = df_summary, 
+              aes(x = prevalence, ymin = KO_richness_min, ymax = KO_richness_max),
+              fill = "grey", alpha = 0.15) +
+  
+  # Individual data points with color gradient
+  geom_point(data = df_ko_prevalance, 
+             aes(x = prevalence, y = KO_richness, color = KO_richness),
+             alpha = 0.6, size = 1.5) +
+  
+  scale_color_gradient(low = "#93CEDF", high = "#D4693F", name = "KO Richness") +
+  
+  geom_line(data = df_summary, aes(x = prevalence, y = KO_richness_max), 
+            color = "#D4693F", size = 1) +
+  geom_line(data = df_summary, aes(x = prevalence, y = KO_richness_min), 
+            color = "#93CEDF", size = 1) +
+  
+  geom_smooth(data = df_summary, aes(x = prevalence, y = KO_richness_min),
+              method = "lm", formula = y ~ x, se = FALSE, 
+              color = "black", linetype = "dashed") +
+  
+  annotate("text", x = Inf, y = Inf,
+           label = paste(lm_eq, r_squared, sep = "\n"),
+           hjust = 1.1, vjust = 1.1, size = 5) +
+  
+  labs(x = "Prevalence", y = "KO_Richness") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+    axis.text.x  = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y  = element_text(size = 14, color = "black"),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14),
+    legend.text  = element_text(size = 12),
+    plot.margin  = margin(10, 10, 10, 10, "pt")
+  )
+
+print(final_plot)
+
+ggsave("result/prevalence_KO_richness_change_16s.pdf",
+       plot = final_plot, width = 10, height = 6, units = "in")
+```
+
+#ITS Samples
+```{r}
+rm(list = ls())
+source("Tools.R")
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(tidyr)
+library(reshape2)
+library(forcats)
+taxonomy_its_final = read.delim("taxonomy_its_final.txt")
+#The relationship between the taxonomic species composition of ITS samples and their prevalence rates
+prevalence_Class_its = taxonomy_its_final[ ,c("prevalence","Class")]
+prevalence_Class_its[prevalence_Class_its$prevalence >= 15,]$prevalence = 15
+make_mutibar(datain = prevalence_Class_its,
+             out_dir = "result/prevalence_Class_change_its.pdf",
+             x_name = "prevalence",
+             y_name = "Proportion of Taxid",
+             legend_name = "Class",
+             limit_num = 10,
+             width = 15,
+             height = 7,
+             other_list = c("Unassigned","Incertae Sedis","Unknown"),
+             colorlist =  c("#FCB366", "#FE816F", "#90D7C7","#93BCD0", "#AF3F4F", 
+                            "#F3BB34", "#F8AD9A", "#5163B5", "#613767", "#56B394",
+                            "#DC6D73", "#B2B896", "#E97DAE","#FB7A64","#EDCE35", 
+                            "#E5C28C", "#CA8BB6", "#1A6C92", "#EAB46E", "#8CC3BD", 
+                            "#4E56AB","#0FBFBC", "#E9A564", "#ADD565", "#ADADAD", 
+                            "#8F9EC5", "#6C77B5", "#138A8E", "#4B9D77", "#8E60A8")
+)
+Class_test = Calculate_correlation(prevalence_Class_its,"prevalence","Class")
+class_prop = as.data.frame(table(prevalence_Class_its$Class))
+main_class = class_prop$Var1[class_prop$Freq>50]
+Class_test = Class_test[Class_test$Variable%in%main_class,]
+print(Class_test)
+#The relationship between the proportion of mycorrhizal fungi in ITS samples and their prevalence rate
+prevalence_Mycorrhizal_its = taxonomy_its_final[ ,c("prevalence","Mycorrhizal")]
+prevalence_Mycorrhizal_its <- prevalence_Mycorrhizal_its %>%
+  replace(is.na(.), "Unknown")
+prevalence_Mycorrhizal_its[prevalence_Mycorrhizal_its$prevalence >= 15,]$prevalence = 15
+prevalence_Mycorrhizal_its[prevalence_Mycorrhizal_its$prevalence >= 15,]$prevalence = 15
+make_mutibar(datain = prevalence_Mycorrhizal_its,
+             out_dir = "result/prevalence_Mycorrhizal_change_its.pdf",
+             x_name = "prevalence",
+             y_name = "Proportion of Taxid",
+             legend_name = "Mycorrhizal",
+             limit_num = 10,
+             width = 10,
+             height = 4,
+             other_list = c("Unassigned","Incertae Sedis","Unknown"),
+             colorlist = c("#C1D2E2","#4B5B74","#eeeeee")
+)
+Mycorrhizal_test = Calculate_correlation(prevalence_Mycorrhizal_its,"prevalence","Mycorrhizal")
+print(Mycorrhizal_test)
+```
+
+
+#Identify which genes have an increased or decreased occurrence rate as the popularity increases or decreases.
+```{r,warning=FALSE}
+rm(list = ls())
+source("Tools.R")
+
+library(dplyr)
+library(tidyr)
+
+taxonomy_16s_final <- read.delim("taxonomy_16s_final.txt")
+ko_data <- read.table("raw/ko_data.tsv", header = TRUE, row.names = 1, sep = "\t")
+
+colnames(ko_data) <- gsub("ko\\.", "", colnames(ko_data))
+ko_data[ko_data != 0] <- 1
+
+type_data <- taxonomy_16s_final[, c("taxid", "prevalence")]
+type_data$prevalence[type_data$prevalence >= 20] <- 20
+
+indata <- merge(type_data, ko_data, by.x = "taxid", by.y = "row.names")
+
+# Convert to long format and calculate proportion of presence per prevalence group
+result_df <- indata %>%
+  pivot_longer(
+    cols = -c(taxid, prevalence),
+    names_to = "gene",
+    values_to = "presence"
+  ) %>%
+  group_by(prevalence, gene) %>%
+  summarise(
+    proportion = sum(presence == 1, na.rm = TRUE) / n(),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = gene,
+    values_from = proportion
+  )
+
+alpha <- 0.001
+
+positive_vars <- character(0)
+negative_vars <- character(0)
+
+result_df$prevalence <- as.numeric(result_df$prevalence)
+independent_var <- result_df$prevalence
+dependent_df <- result_df[, -1, drop = FALSE]
+
+for (col_name in names(dependent_df)) {
+  dependent_var <- dependent_df[[col_name]]
+  
+  test_result <- tryCatch({
+    cor.test(independent_var, dependent_var, method = "pearson")
+  }, error = function(e) NULL)
+  
+  if (is.null(test_result)) next
+  
+  p_value <- test_result$p.value
+  cor_coef <- test_result$estimate
+  
+  if (!is.na(p_value) && !is.na(cor_coef)) {
+    if (p_value < alpha) {
+      if (cor_coef > 0) {
+        positive_vars <- c(positive_vars, col_name)
+      } else if (cor_coef < 0) {
+        negative_vars <- c(negative_vars, col_name)
+      }
+    }
+  }
+}
+
+positive_vars <- data.frame(p_ko = positive_vars)
+negative_vars <- data.frame(n_ko = negative_vars)
+
+# Load KEGG classification
+ko_level_table <- read.delim("raw/ko_level_table.txt")
+
+p_ko_level <- merge(positive_vars, ko_level_table, by.x = "p_ko", by.y = "KO")
+n_ko_level <- merge(negative_vars, ko_level_table, by.x = "n_ko", by.y = "KO")
+
+# Top 10 level3 categories
+p_level3_10 <- names(sort(table(p_ko_level$level3), decreasing = TRUE)[1:10])
+n_level3_10 <- names(sort(table(n_ko_level$level3), decreasing = TRUE)[1:10])
+
+# Unique and shared functions
+p_level3_10_unique <- setdiff(p_level3_10, n_level3_10)
+n_level3_10_unique <- setdiff(n_level3_10, p_level3_10)
+common_func <- intersect(p_level3_10, n_level3_10)
+
+print(p_level3_10_unique)
+print(n_level3_10_unique)
+print(common_func)
+```
+
+#Use a pie chart to observe the species composition and characteristics in the groups with low popularity and low genetic diversity.
+```{r,fig.show='animate'}
+rm(list = ls())
+source("Tools.R")
+taxonomy_16s_final = read.delim("taxonomy_16s_final.txt")
+taxonomy_16s_final = taxonomy_16s_final[taxonomy_16s_final$KO_richness != "Unknown",]
+taxonomy_16s_final$KO_richness = as.numeric(taxonomy_16s_final$KO_richness)
+taxonomy_16s_final_ko800 = taxonomy_16s_final[taxonomy_16s_final$KO_richness <= 800 & taxonomy_16s_final$prevalence <=5,]
+p1 = draw_pie_chart(taxonomy_16s_final_ko800,"Class", label = F, pre = TRUE,"Class",limit_n = 10)
+p1
+ggsave("result/ko800_Class.pdf",p1,width = 7,height = 6)
+
+p2 = draw_pie_chart(taxonomy_16s_final_ko800,"Aerobic_type", label = F, pre = TRUE,"Aerobic_type",color_list = c("#D4693F","#eeeeee","#E4A644","#99C2C8"))
+p2
+ggsave("result/ko800_Aerobic_type.pdf",p2,width = 7,height = 6)
+
+p3 = draw_pie_chart(taxonomy_16s_final_ko800,"Forms_Biofilms", label = F, pre = TRUE,"Forms_Biofilms",color_list = c("#E8C2D9","#846992","#eeeeee"))
+p3
+ggsave("result/ko800_Forms_Biofilms.pdf",p3,width = 7,height = 6)
+
+
+
+#Observe the composition of mycorrhizal fungi and the main plants they are distributed among.
+taxonomy_its_final = read.delim("taxonomy_its_final.txt")
+Mycorrhizal_TAX = taxonomy_its_final[taxonomy_its_final$Mycorrhizal=="TRUE", ]
+
+p4 = draw_pie_chart(Mycorrhizal_TAX,"Order", label = F, pre = TRUE,"Mycorrhizal_Order",limit_n = 15)
+p4
+ggsave("result/Mycorrhizal_Order_pie.pdf", plot = p4,width = 6,height = 5,units = "in")
+Mycorrhizal_TAX[is.na(Mycorrhizal_TAX)]="Unknown"
+p5 = draw_pie_chart(Mycorrhizal_TAX[Mycorrhizal_TAX$specialist_plant != "Unknown", ],"specialist_plant", label = F, pre = TRUE,"Mycorrhizal_specialist_plant",limit_n = 15)
+p5
+ggsave("result/Mycorrhizal_specialist_plant_pie.pdf", plot = p5,width = 6,height = 5,units = "in")
+```
+
+# Search for microorganisms that occur at a frequency difference of more than 30% in C3 and C4 plants.
+```{r,fig.show='animate'}
+rm(list = ls())
+
+library(tidyr)
+library(tibble)
+library(tidyverse)
+
+# Load data
+metadata_16s       <- read.csv("raw/metadata_all16s.csv")
+taxonomy_16s_final <- read.delim("taxonomy_16s_final.txt")
+PG_taxid_16s       <- read.delim("PG_taxid_16s.txt", row.names = 1)
+sample_taxid_01_16s <- read.delim("sample_taxid_01_16s.txt", row.names = 1)
+
+# Split metadata by photosynthetic pathway
+c4_metadata_16s <- metadata_16s[metadata_16s$pathway == "C4", ]
+C3_metadata_16s <- metadata_16s[metadata_16s$pathway == "C3", ]
+
+# Genus-level presence/absence table
+Sid_BG_01_16s <- merge(taxonomy_16s_final[, c("taxid", "Genus")], 
+                       sample_taxid_01_16s, 
+                       by.x = "taxid", by.y = "row.names")[ ,-1] %>%
+  group_by(Genus) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  column_to_rownames(var = "Genus")
+
+Sid_BG_01_16s[Sid_BG_01_16s != 0] <- 1
+
+# Subset by group
+c4_01_16s_BG <- Sid_BG_01_16s[, c4_metadata_16s$SampleID]
+c4_01_16s_BG$rate <- rowSums(c4_01_16s_BG) / ncol(c4_01_16s_BG)
+
+C3_01_16s_BG <- Sid_BG_01_16s[, C3_metadata_16s$SampleID]
+C3_01_16s_BG$rate <- rowSums(C3_01_16s_BG) / ncol(C3_01_16s_BG)
+
+# Prepare comparison (difference ≥ 30%)
+all_genus <- rownames(c4_01_16s_BG)
+all_genus <- all_genus[!all_genus %in% c("Unassigned", "Incertae Sedis")]
+
+C4_VS_C3_allrate <- data.frame(
+  Genus   = all_genus,
+  C4_rate = c4_01_16s_BG[all_genus, ]$rate,
+  C3_rate = C3_01_16s_BG[all_genus, ]$rate
+)
+
+C4_VS_C3_allrate$differ <- C4_VS_C3_allrate$C4_rate - C4_VS_C3_allrate$C3_rate
+
+# Select genera with strong difference
+C4_VS_C3_differ_p <- C4_VS_C3_allrate[C4_VS_C3_allrate$differ >= 0.3, ]
+C4_VS_C3_differ_p <- C4_VS_C3_differ_p[order(C4_VS_C3_differ_p$C4_rate, decreasing = TRUE), -4]
+
+C4_VS_C3_differ_n <- C4_VS_C3_allrate[C4_VS_C3_allrate$differ <= -0.3, ]
+C4_VS_C3_differ_n <- C4_VS_C3_differ_n[order(C4_VS_C3_differ_n$C3_rate, decreasing = FALSE), -4]
+
+C4_VS_C3_differ <- rbind(C4_VS_C3_differ_p, C4_VS_C3_differ_n)
+
+# Prepare data for plotting
+df_long <- pivot_longer(C4_VS_C3_differ, 
+                        cols = c(C4_rate, C3_rate), 
+                        names_to = "variable", 
+                        values_to = "value")
+
+df_long$Genus <- factor(df_long$Genus, levels = C4_VS_C3_differ$Genus)
+
+# Plot
+ggplot(df_long, aes(x = Genus, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(x = "Genus", y = "Occurrence Rate", title = "", fill = "") +
+  scale_fill_manual(values = c("C4_rate" = "#f7e09b", "C3_rate" = "#517d7e")) +
+  theme_classic() +
+  theme(
+    legend.position = "top",
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+    axis.text.x  = element_text(size = 14, color = "black", angle = -45, hjust = 0, vjust = 1),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y  = element_text(size = 14, color = "black"),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14, color = "black"),
+    legend.text  = element_text(size = 14, color = "black"),
+    plot.margin  = margin(t = 10, r = 30, b = 10, l = 10, unit = "pt")
+  )
+
+ggsave("result/C4_VS_C3_differ.pdf", width = 12, height = 5)
+```
+
+# Observe the storage situation of nitrogen-fixing bacteria in different plants
+```{r,fig.show='animate'}
+rm(list = ls())
+source("Tools.R")
+library(tidyr)
+library(tibble)
+library(tidyverse)
+library(pheatmap)
+library(ape)
+nf = read.delim("raw/nitrogen_fixation.txt")
+metadata_16s = read.csv("raw/metadata_all16s.csv")
+taxonomy_16s_final = read.delim("taxonomy_16s_final.txt")
+PG_taxid_16s = read.delim("PG_taxid_16s.txt")
+
+PG_MG_sum_16s = merge(taxonomy_16s_final[ ,c("taxid","Genus")],PG_taxid_16s,by = "taxid")[ ,-1] %>%
+  group_by(Genus) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  column_to_rownames(var = "Genus")
+rownames(PG_MG_sum_16s)[which(rownames(PG_MG_sum_16s) == "Burkholderia-Caballeronia-Paraburkholderia")] <- "Burkholderia"
+
+
+#Create the plant classification tree corresponding to the 16s sample (please visualize it using itol)
+plant_taxonomy = unique(metadata_16s[ ,c(5:9)])
+plant_taxonomy$Kingdom = "Plantae"
+write.table(plant_taxonomy,file = "result/plant_taxonomy.txt",sep = "\t", 
+            row.names = FALSE,col.names = TRUE,quote = FALSE,fileEncoding = "UTF-8")
+class_tree("result/plant_taxonomy.txt","result/plant_tree_16s.newick","Genus")
+#Arrange in the order specified in ITOL
+plant_order = c("Azolla","Achnatherum","Zea","Urochloa","Triticum","Thinopyrum","Sorghum",
+                "Setaria","Saccharum","Panicum","Oryza","Lolium","Hordeum","Brachypodium",
+                "Aegilops","Cannabis","Anemone","Solanum","Scabiosa","Parnassia","Manihot",
+                "Citrus","Citrullus","Nothofagus","Carya","Panax","Astrantia","Theobroma",
+                "Gossypium","Cistanche","Phelipanche","Euphrasia","Saussurea","Ligularia",
+                "Helianthus","Coffea","Halenia","Gentianella","Gentiana","Heliosperma",
+                "Chenopodium","Stenocereus","Ferocactus","Echinocactus","Thlaspi","Raphanus",
+                "Descurainia","Brassica","Arabidopsis","Sophora","Pisum","Phaseolus","Lens","Glycine")
+
+# Convert it into a matrix, which is the required data format for the pheatmap function.
+
+
+PG_NF_sum_16s = PG_MG_sum_16s[nf$Genus, ]
+PG_NF_sum_16s[PG_NF_sum_16s != 0] <- 1
+PG_NF_sum_16s = PG_NF_sum_16s[ ,plant_order]
+data_matrix <- as.matrix(t(PG_NF_sum_16s))
+my_colors <- c("white", "#A23F25")
+
+pheatmap(data_matrix,
+               color = my_colors,        
+               cluster_rows = F,      
+               cluster_cols = F,     
+               clustering_distance_cols = "euclidean", 
+               clustering_method = "complete", 
+               show_rownames = TRUE,     
+               show_colnames = TRUE,     
+               main = "The Distribution of Symbiotic Nitrogen-fixing Bacteria" 
+)
+
+
+PG_MG_sum_16s[PG_MG_sum_16s != 0] <- 1
+PG_MG_sum_16s_t = t(PG_MG_sum_16s)
+PG_MG_sum_16s$sum = rowSums(PG_MG_sum_16s)
+
+PG_NF_sum_16s = merge(nf,PG_MG_sum_16s,by.x ="Genus",by.y = "row.names")
+df_sorted <- PG_NF_sum_16s[order(PG_NF_sum_16s$sum, decreasing = TRUE), ]
+df_sorted <- na.omit(df_sorted)
+
+df_sorted$color <- ifelse(df_sorted$classify == "Endophytic", "#FCB366",
+                          ifelse(df_sorted$classify == "Rhizobial", "#FE816F",
+                                 ifelse(df_sorted$classify == "Free_living", "#90D7C7", NA)))
+ggplot(df_sorted, aes(x = reorder(df_sorted$Genus, -sum), y = sum, fill = Genus)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = setNames(df_sorted$color, df_sorted$Genus)) +
+  geom_text(aes(label = sum), vjust = -0.5, size = 4)+
+  theme_minimal() +
+  labs(x = "Nitrogen-fixing Bacteria Genus", y = "Merged Prevalence")+
+  theme_bw() + 
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5, 
+      margin = margin(b = 10)  
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5,  
+      lineheight = 1.2, 
+      margin = margin(b = 15)
+    ),
+    axis.text.x = element_text(size = 14, color = "black", angle = -45, hjust = 0, vjust = 1),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0), 
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"), 
+    legend.title = element_text(size = 14, color = "black"), 
+    legend.text = element_text(size = 12, color = "black"), 
+    plot.margin = margin(t = 10,  
+                         r = 70,  
+                         b = 10,  
+                         l = 10,  
+                         unit = "pt")  
+  )
+ggsave("result/NF_BAR_SUM.pdf",width = 15,height = 9)
+
+
+
+PG_MG_sum_16s_t_nf =as.data.frame(PG_MG_sum_16s_t[ ,nf$Genus]) 
+PG_MG_sum_16s_t_nf$sum = rowSums(PG_MG_sum_16s_t_nf)
+df_sorted <- PG_MG_sum_16s_t_nf[order(PG_MG_sum_16s_t_nf$sum, decreasing = TRUE), ]
+df_sorted <- na.omit(df_sorted)
+ggplot(df_sorted, aes(x = reorder(rownames(df_sorted), -sum), y = sum)) +
+  geom_col(aes(fill = sum)) + 
+  scale_fill_gradient(low = "#93CEDF", high = "#E4A644") + 
+  geom_text(aes(label = sum), vjust = -0.5, size = 4) + 
+  labs(x = "Plant Genus", y = "Nitrogen-fixing Bacteria Richness",fill = "Nitrogen-fixing\nBacteria Richness\n(Max= 41)") +
+  theme_bw() + 
+  theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5, 
+      margin = margin(b = 10)  
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5,  
+      lineheight = 1.2, 
+      margin = margin(b = 15)
+    ),
+    axis.text.x = element_text(size = 14, color = "black", angle = -45, hjust = 0, vjust = 1),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0), 
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"), 
+    legend.title = element_text(size = 14, color = "black"), 
+    legend.text = element_text(size = 12, color = "black"), 
+    plot.margin = margin(t = 10,  
+                         r = 70,  
+                         b = 10,  
+                         l = 10,  
+                         unit = "pt")  
+  )
+ggsave("result/Plant_NF_Richness.pdf",width = 15,height = 9)
+
+
+General16s_genus = read.delim("General_tree_16s/annotation_16s.txt")$Genus
+General_nf_genus = intersect(General16s_genus, nf$Genus)
+print(General_nf_genus)
+```
+
+# Draw a heatmap of microbial functions
+```{r,fig.show='animate'}
+rm(list = ls())
+library(pheatmap)
+
+micro_function    <- read.delim("raw/micro_function.txt")
+taxonomy_16s_final <- read.delim("taxonomy_16s_final.txt")
+PG_MG_sum_16s     <- read.delim("PG_MG_sum_16s.txt", row.names = 1)
+PG_MG_sum_its     <- read.delim("PG_MG_sum_its.txt", row.names = 1)
+
+micro_function_merge <- micro_function %>%
+  group_by(Genus) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  column_to_rownames(var = "Genus")
+
+high_prevalence_16s <- rownames(PG_MG_sum_16s[PG_MG_sum_16s$sum >= 28, ] %>% arrange(desc(sum)))
+high_prevalence_its <- rownames(PG_MG_sum_its[PG_MG_sum_its$sum >= 15, ] %>% arrange(desc(sum)))
+
+micro_function_merge_16s <- micro_function_merge[high_prevalence_16s, ]
+micro_function_merge_16s <- na.omit(micro_function_merge_16s)
+micro_function_merge_16s <- micro_function_merge_16s[rowSums(micro_function_merge_16s != 0) > 0, ]
+
+micro_function_merge_its <- micro_function_merge[high_prevalence_its, ]
+micro_function_merge_its <- na.omit(micro_function_merge_its)
+micro_function_merge_its <- micro_function_merge_its[rowSums(micro_function_merge_its != 0) > 0, ]
+
+# Custom green gradient: 0–5 light-to-dark green, >5 stays darkest green
+create_green_gradient <- function(n_colors = 32) {
+  greens <- colorRampPalette(c("#ffffff", "#E5F5E0", "#C7E9C0",
+                               "#A1D99B", "#74C476", "#41AB5D"))(6)
+  
+  colors <- character(n_colors)
+  for (i in 0:(n_colors-1)) {
+    if (i <= 5) {
+      colors[i+1] <- greens[i+1]
+    } else {
+      colors[i+1] <- "#238B45"
+    }
+  }
+  return(colors)
+}
+
+# Method to show numbers only when value > 0
+create_number_matrix <- function(data_matrix) {
+  num_matrix <- matrix(as.character(data_matrix),
+                       nrow = nrow(data_matrix),
+                       ncol = ncol(data_matrix))
+  num_matrix[data_matrix == 0] <- ""
+  return(num_matrix)
+}
+
+# ─── 16S version ───────────────────────────────────────
+inputmatrix_16s <- as.matrix(micro_function_merge_16s) + 1
+number_matrix_16s <- create_number_matrix(as.matrix(micro_function_merge_16s))
+
+pheatmap(inputmatrix_16s,
+         color = create_green_gradient(33),
+         breaks = seq(0, 33, length.out = 33),
+         display_numbers = number_matrix_16s,
+         number_color = "black",
+         fontsize_number = 10,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         main = "",
+         border_color = "gray80",
+         cellwidth = 40,
+         cellheight = 15)
+
+# ─── ITS version ───────────────────────────────────────
+inputmatrix_its <- as.matrix(micro_function_merge_its) + 1
+number_matrix_its <- create_number_matrix(as.matrix(micro_function_merge_its))
+
+pheatmap(inputmatrix_its,
+         color = create_green_gradient(22),
+         breaks = seq(0, 22, length.out = 22),
+         display_numbers = number_matrix_its,
+         number_color = "black",
+         fontsize_number = 10,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         main = "",
+         border_color = "gray80",
+         cellwidth = 40,
+         cellheight = 15)
+```
+
+
+
+
