@@ -1,0 +1,3158 @@
+---
+title: "analysis_pipeline"
+author: "Zilong Wang"
+date: "2026-03-16"
+output:
+  pdf_document: default
+  html_document: default
+---
+# Download and install all the required R packages
+```{r}
+# Install CRAN packages
+install.packages(c(
+  "ggplot2", "patchwork", "ggpubr", "dplyr", "scales",
+  "stringr", "ape", "data.table", "flextable", "vegan",
+  "parallelDist", "reshape2", "forcats"
+))
+
+# Install Bioconductor packages
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+BiocManager::install(c("Biostrings", "ComplexHeatmap"))
+
+# itol.toolkit (GitHub)
+install.packages("devtools")
+devtools::install_github("TongZhou2017/itol.toolkit")
+```
+
+
+
+#The proportion of annotable reads in the visualized sequence to the total number of reads
+```{r,fig.height = 5,fig.with = 12}
+rm(list = ls())
+library(ggplot2)
+library(patchwork)
+sample_taxid_abundance_16s = read.delim("raw/sample_taxid_abundance_16s.txt", row.names = 1)
+sample_taxid_abundance_its = read.delim("raw/sample_taxid_abundance_its.txt", row.names = 1)
+# Calculate the annotation ratio ((1 - Unassigned / Total sum of each column))
+unassigned_values <- as.numeric(sample_taxid_abundance_16s[rownames(sample_taxid_abundance_16s) == "Unassigned", ])
+col_totals <- colSums(sample_taxid_abundance_16s)
+annotated_prop <- 1 - (unassigned_values / col_totals)
+plot_data <- data.frame(annotated_proportion = annotated_prop)
+
+# Calculate the basic statistics (mean and standard deviation)
+mean_val <- mean(plot_data$annotated_proportion, na.rm = TRUE)
+sd_val <- sd(plot_data$annotated_proportion, na.rm = TRUE)
+
+
+hist_plot1 <- ggplot(plot_data, aes(x = annotated_proportion)) +
+  geom_histogram(fill = "#56B394", color = "black", bins = 30, alpha = 0.8) + 
+  xlab("The annotated proportion") +
+  ylab("Counts")+
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+           label = paste0("Mean: ", round(mean_val, 3), "\nSD: ", round(sd_val, 3)),
+           size = 5) +
+  theme_classic() + 
+  theme(
+    legend.position = "top" ,
+    panel.background = element_blank(), 
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5,  
+      margin = margin(b = 10)  
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5,  
+      lineheight = 1.2,  
+      margin = margin(b = 15) 
+    ),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0), 
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"), 
+    legend.title = element_text(size = 14, color = "black"), 
+    legend.text = element_text(size = 14, color = "black"), 
+    plot.margin = margin(t = 10,  
+                         r = 30,  
+                         b = 10,  
+                         l = 10,  
+                         unit = "pt") 
+  )
+
+#its
+unassigned_values <- as.numeric(sample_taxid_abundance_its[rownames(sample_taxid_abundance_its) == "Unassigned", ])
+col_totals <- colSums(sample_taxid_abundance_its)
+annotated_prop <- 1 - (unassigned_values / col_totals)
+plot_data <- data.frame(annotated_proportion = annotated_prop)
+mean_val <- mean(plot_data$annotated_proportion, na.rm = TRUE)
+sd_val <- sd(plot_data$annotated_proportion, na.rm = TRUE)
+hist_plot2 <- ggplot(plot_data, aes(x = annotated_proportion)) +
+  geom_histogram(fill = "#56B394", color = "black", bins = 30, alpha = 0.8) +
+  xlab("The annotated proportion") +
+  ylab("Counts")+
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.1,
+           label = paste0("Mean: ", round(mean_val, 3), "\nSD: ", round(sd_val, 3)),
+           size = 5) +
+  theme_classic() + 
+  theme(
+    legend.position = "top" ,
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5,
+      margin = margin(b = 10) 
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5,  
+      lineheight = 1.2, 
+      margin = margin(b = 15) 
+    ),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"), 
+    legend.title = element_text(size = 14, color = "black"),
+    legend.text = element_text(size = 14, color = "black"), 
+    plot.margin = margin(t = 10,  
+                         r = 30,  
+                         b = 10,  
+                         l = 10, 
+                         unit = "pt")
+  )
+library(ggpubr)
+combined_plot <- ggarrange(hist_plot1, hist_plot2,  
+                           ncol = 2 
+)
+combined_plot
+dir.create("result/Sample_Overview")
+ggsave("result/Sample_Overview/Annotated_Proportions.pdf",combined_plot,width = 11,height = 3.2)
+```
+
+#Visualization extraction methods and the proportion of sequencing regions
+```{r,fig.show='animate'}
+rm(list = ls())
+source("Tools.R")
+library(ggplot2)
+library(dplyr)
+library(scales)
+metadata_16s <- read.delim("raw/metadata_16s.txt")
+metadata_its <- read.delim("raw/metadata_its.txt")
+
+# 16s extract_way
+p1 = draw_pie_chart(metadata_16s,"extract_way", label = TRUE, pre = TRUE,"Extract Way")
+p1
+ggsave("result/Sample_Overview/extact_way_16s.pdf",p1,width = 6,height = 6)
+# 16s Sequencing Region
+p2 = draw_pie_chart(metadata_16s,"region", label = F, pre = TRUE,"Sequencing Region",color_list = c("#1F4A7A", "#E0F2FF","#8CA9D9", "#2A7777", "#A3BFD4","#7ED4D4", "#B5E8D5"))
+p2
+ggsave("result/Sample_Overview/Sequencing_Region_16s.pdf",p2,width = 6,height = 4)
+# its extract_way
+p3 = draw_pie_chart(metadata_its,"extract_way", label = TRUE, pre = TRUE,"Extract Way")
+p3
+ggsave("result/Sample_Overview/extact_way_its.pdf",p3,width = 6,height = 4)
+# its Sequencing Region
+p4 = draw_pie_chart(metadata_its,"region", label = TRUE, pre = TRUE,"Region",color_list = c("#1F4A7A", "#E0F2FF"))
+p4
+ggsave("result/Sample_Overview/Sequencing_Region_its.pdf",p4,width = 6,height = 4)
+```
+
+
+# Construct a species-level phylogenetic tree based on TimeTree5
+```{r}
+rm(list = ls())
+library(dplyr)
+library(stringr)
+dir.create("planttree")
+metadata_16s = read.delim("raw/metadata_16s.txt")
+metadata_its = read.delim("raw/metadata_its.txt")
+all_plant_tax = unique(rbind(metadata_16s[,c("Genus","Species","timetree")],metadata_its[,c("Genus","Species","timetree")]))
+all_plant_timetree = unique(c(metadata_16s$timetree,metadata_its$timetree))
+# Create the input file for timetree5
+writeLines(all_plant_timetree,"planttree/species_all.txt")
+#！！！You need to obtain the tree file by yourself from the TimeTree5 platform！！！
+# The obtained tree file (species_all.nwk)  has been placed in the "raw" folder.
+
+if (file.exists("raw/species_all.nwk")) {
+  message("Find the target file and continue running...")
+  library(ape)
+  species_all_tree = read.tree("raw/species_all.nwk")
+  #修改叶节点标签
+  species_all_tree$tip.label <- all_plant_tax$Species[match(species_all_tree$tip.label, all_plant_tax$timetree)]
+  write.tree(species_all_tree, file = "planttree/plant_species_tree_all.nwk")
+  #裁剪出16s树
+  tree_16s <- keep.tip(species_all_tree, tip = unique(metadata_16s$Species))
+  write.tree(tree_16s, file = "planttree/plant_species_tree_16s.nwk")
+  #裁剪出its树
+  tree_its <- keep.tip(species_all_tree, tip = unique(metadata_its$Species))
+  write.tree(tree_its, file = "planttree/plant_species_tree_its.nwk")
+  #从Species树中裁剪出一颗Genus树
+  #从每个Genus中挑选一个species
+  replace_vec_SP <- all_plant_tax[!duplicated(all_plant_tax[, "Genus"]), ]
+  plant_Genus_tree_all = keep.tip(species_all_tree, tip = replace_vec_SP$Species)
+  plant_Genus_tree_all$tip.label <- replace_vec_SP$Genus[match(plant_Genus_tree_all$tip.label, replace_vec_SP$Species)]
+  write.tree(plant_Genus_tree_all, file = "planttree/plant_Genus_tree_all.nwk")
+} else {
+  stop("请将species_all.txt文件在timetree5平台中注释，导出树文件到planttree文件夹")
+}
+
+```
+
+
+
+
+
+
+#制作植物分类树和对应总结表
+```{r}
+rm(list = ls())
+library(dplyr)
+library(data.table)
+library(flextable)
+library(ape)
+library(itol.toolkit)
+library(stringr)
+library(tidyr)
+library(tibble)
+source("Tools.R")
+plant_Genus_tree_all = read.tree("planttree/plant_Genus_tree_all.nwk")
+tree_label <- plant_Genus_tree_all$tip.label[plant_Genus_tree_all$edge[,2][plant_Genus_tree_all$edge[,2] <= length(plant_Genus_tree_all$tip.label)]]
+name_df = data.frame(index = c(1:length(tree_label)),
+                     Genus = tree_label)
+metadata_16s <- read.delim("raw/metadata_16s.txt")
+metadata_16s$type = "16s"
+metadata_its <- read.delim("raw/metadata_its.txt")
+metadata_its$type = "its"
+all_metadata = rbind(metadata_16s,metadata_its)
+write.table(all_metadata,file = "result/Sample_Overview/all_metadata.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+country_df = as.data.frame(table(all_metadata$country))
+country_df = country_df[order(country_df$Freq, decreasing = TRUE), ]
+country_df = country_df[country_df$Var1!="unknown",]
+writeLines(paste0('"', country_df$Var1, '"', collapse = ","),"result/Sample_Overview/country.txt")
+writeLines(paste0(country_df$Freq, collapse = ","),"result/Sample_Overview/country_Freq.txt")
+# 生成两个十六进制颜色之间的渐变色彩
+# 参数：color1 起始色（#xxxxxx），color2 结束色（#xxxxxx），n 渐变颜色数量
+# 返回：n个十六进制颜色字符向量
+p = draw_pie_chart(all_metadata,"country", label = F, pre = TRUE,"Country",limit_n = 15,
+                   color_list = c("#3A5A40", "#F2CC8F", "#81B29A", "#3D405B", "#F4A261",
+                                  "#099396" ,"#E7D6C2" ,"#547FB6" ,"#C5D8E7" ,"#BF6173",
+                                  "#E07A5F", "#90DBF4", "#641E16", "#A7C957", "#D35400"))
+p
+ggsave("result/Sample_Overview/country_freq_pie.pdf",p,width = 8,height = 6)
+
+
+
+result <- all_metadata %>%
+  group_by(Order, Genus) %>%
+  summarize(
+    samples_16s = sum(`type` == "16s", na.rm = TRUE),
+    samples_its = sum(`type` == "its", na.rm = TRUE),
+    ratio_samples = paste(samples_16s, samples_its, sep = "|"),
+    studies_16s = n_distinct(Cite3[`type` == "16s"]),
+    studies_its = n_distinct(Cite3[`type` == "its"]),
+    ratio_studies = paste(studies_16s, studies_its, sep = "|"),
+    references = paste(unique(Cite3), collapse = "; ")
+  ) %>%
+  ungroup() %>%
+  arrange(Order, Genus)
+
+result = merge(name_df,result,by="Genus")
+result = result %>% arrange(index)
+write.table(result,file = "result/Sample_Overview/sample_summary_table.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+colnames(result)
+ft <- flextable(result[ ,c("Genus","Order","ratio_samples","ratio_studies","references")])
+all_metadata <- rbind(metadata_16s, metadata_its)
+
+# Set column headers
+ft <- set_header_labels(ft,
+                        Order = "Order",
+                        Genus = "Genus",
+                        ratio_samples = "Samples 16S/ITS",
+                        ratio_studies = "Studies 16S/ITS",
+                        references = "References"
+)
+# Merge vertically identical Order cells
+ft <- merge_v(ft, j = "Order")
+# Add thin inner borders for all cells (corrected with officer::fp_border)
+ft <- border_inner(ft, border = officer::fp_border(width = 0.5))
+# Add outer borders
+ft <- border_outer(ft, border = officer::fp_border(width = 1))
+ft
+
+#制作树注释文件
+#计算每个植物属的richness
+sample_taxid_01_16s = fread("standard/sample_taxid_01_16s.txt")
+sample_taxid_01_16s = as.data.frame(column_to_rownames(sample_taxid_01_16s,"taxid"))
+
+sample_taxid_01_its = fread("standard/sample_taxid_01_its.txt")
+sample_taxid_01_its = as.data.frame(column_to_rownames(sample_taxid_01_its,"taxid"))
+
+long_richness_16s = as.data.frame(colSums(sample_taxid_01_16s))
+PG_mean_richness_16s = merge_datafame(long_richness_16s,row_group = metadata_16s[ ,c("SampleID","Genus")],row_method = "mean")
+long_richness_16s = merge(long_richness_16s,metadata_16s[ ,c("SampleID","Genus")],by.x = "row.names",by.y = "SampleID",all.x = TRUE)[ ,c(3,2)]
+colnames(long_richness_16s)[2] = "richness_16s_log10"
+long_richness_16s$richness_16s_log10 = log10(long_richness_16s$richness_16s_log10)
+
+long_richness_its = as.data.frame(colSums(sample_taxid_01_its))
+PG_mean_richness_its = merge_datafame(long_richness_its,row_group = metadata_its[ ,c("SampleID","Genus")],row_method = "mean")
+long_richness_its = merge(long_richness_its,metadata_its[ ,c("SampleID","Genus")],by.x = "row.names",by.y = "SampleID",all.x = TRUE)[ ,c(3,2)]
+colnames(long_richness_its)[2] = "richness_its_log10"
+long_richness_its$richness_its_log10 = log10(long_richness_its$richness_its_log10)
+
+dir.create("planttree/all_tree")
+annotation = unique(all_metadata[ ,c("Kingdom","Phylum","Class","Order","Family","Genus")])
+annotation = merge(annotation,result[ ,-3],by = "Genus")
+annotation$lable = paste(annotation$Genus,annotation$ratio_samples)
+annotation = annotation %>% arrange(index)
+write.table(annotation,file = "planttree/all_tree/all_plant_annotation.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+colorlist <- c(
+  "#855B67" ,"#B6BCCA" ,"#C1B5BF" ,"#FDE0E4" ,
+  "#78A495" ,"#8A926B" ,"#5D6C57" ,"#6E736D" ,"#E4E2C9",
+  "#CFE1D3" ,"#995B70" ,"#846992" ,"#D4C0C2" ,"#F7E09B",
+  "#099396" ,"#E7D6C2" ,"#547FB6" ,"#C5D8E7" ,"#BF6173",
+  "#3A5A40", "#90DBF4", "#641E16", "#BFEFEE", "#D35400", 
+  "#1D3557", "#F1C40F", "#5B2C6F", "#A7C957", "#E63946", 
+  "#355070", "#F4A261", "#1E5959", "#CB997E", 
+  "#2A9D8F", "#FFE8D6", "#6D597A", "#F9C74F", "#2E4053", 
+  "#A8DADC", "#BA4A00", "#7DCEA0", "#424949", "#E5989B",
+  "#E07A5F", "#F2CC8F", "#81B29A", "#3D405B", "#F4A261",
+  "#E76F51", "#2A9D8F", "#264653", "#F9C74F", "#A8DADC",
+  "#E63946", "#F1FAEE", "#457B9D", "#E0A458", "#6D597A",
+  "#B5E8D5", "#FFBF69", "#2EC4B6", "#1D3557", "#F6BD60",
+  "#8AC6C3", "#E56B6F", "#4A6FA5", "#F5E8C7", "#233D4D"
+)
+tree <- read.tree("planttree/plant_Genus_tree_all.nwk")
+annotation = read.delim("planttree/all_tree/all_plant_annotation.txt")
+hub <- create_hub(tree = tree)
+#制作Order色环
+#配置颜色
+unique_Order = unique(annotation$Order)
+colorlist_Order = colorlist[1:length(unique_Order)]
+Order_color_map = data.frame(Order = unique_Order,
+                                   Order_color = colorlist_Order)
+create_color_legend(Order_color_map, save_path = "planttree/all_tree_order_legend.pdf", shape = "square", 
+                                layout = "col", n = 1, title = "Order", 
+                                label_size = 4, title_size = 5, ifsave = TRUE)
+create_color_legend(Order_color_map, save_path = "planttree/all_tree_order_legend2.pdf", shape = "circle", 
+                                layout = "col", n = 2, title = "Order", 
+                                label_size = 4, title_size = 5, ifsave = TRUE)
+unit_Order <- create_unit(data = merge(annotation[ ,c("Genus","Order")],Order_color_map,by="Order")[ ,c("Genus","Order","Order_color")],
+                                key = "Order",
+                                type = "DATASET_COLORSTRIP",
+                                tree = tree)
+unit_Order@common_themes$legend$horizontal = NULL #调整图例为竖向
+# unit_Order@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Order
+#添加richness箱线图
+unit_richness_16s <- create_unit(data = long_richness_16s,
+                       key = "richness_16s_log10",
+                       type = "DATASET_BOXPLOT",
+                       tree = tree)
+unit_richness_16s@specific_themes$basic_plot$dataset_scale = c(0,1,2,3,4)
+unit_richness_16s@specific_themes$basic_plot$width = "300"
+unit_richness_16s@profile$color = "#355070"
+  
+hub <- hub + unit_richness_16s
+unit_richness_its <- create_unit(data = long_richness_its,
+                                 key = "richness_its_log10",
+                                 type = "DATASET_BOXPLOT",
+                                 tree = tree)
+unit_richness_its@specific_themes$basic_plot$dataset_scale = c(0,1,2,3)
+unit_richness_its@specific_themes$basic_plot$width = "300"
+unit_richness_its@profile$color = "#E0A458"
+hub <- hub + unit_richness_its
+
+#添加
+unit_lable <- create_unit(data = annotation[ ,c("Genus","lable")],
+                          key = "LABELS",
+                          type = "LABELS",
+                          tree = tree)
+hub <- hub + unit_lable
+
+write_hub(hub, "planttree/all_tree")
+
+```
+
+
+
+
+
+
+
+
+
+# Data standardization and host species-level integration
+# Explanation: We have developed a new merging algorithm, which helps to enhance the representativeness of the data and reduce the interference caused by differences in sample sizes.
+```{r}
+rm(list = ls())
+library(tibble)
+library(data.table)
+library(tidyr)
+library(dplyr)
+source("Tools.R")
+dir.create("standard")
+dir.create("result")
+sample_taxid_abundance_16s = fread("raw/sample_taxid_abundance_16s.txt")
+sample_taxid_abundance_16s = as.data.frame(column_to_rownames(sample_taxid_abundance_16s,"taxid"))
+
+sample_taxid_abundance_its = fread("raw/sample_taxid_abundance_its.txt")
+sample_taxid_abundance_its = as.data.frame(column_to_rownames(sample_taxid_abundance_its,"taxid"))
+
+sample_taxid_01_16s = standard_01(sample_taxid_abundance_16s)
+sample_taxid_01_16s = rownames_to_column(sample_taxid_01_16s,var = "taxid")
+write.table(sample_taxid_01_16s,file = "standard/sample_taxid_01_16s.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+sample_taxid_01_its = standard_01(sample_taxid_abundance_its)
+sample_taxid_01_its = rownames_to_column(sample_taxid_01_its,var = "taxid")
+write.table(sample_taxid_01_its,file = "standard/sample_taxid_01_its.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+#数据合并
+metadata_16s = read.delim("raw/metadata_16s.txt")
+metadata_its = read.delim("raw/metadata_its.txt")
+
+
+# This is a function for merging species tables, which extracts representative species from a classification.
+# Merging principle: Firstly, count the occurrence frequency of each species in this group of samples, that is, the prevalence rate.
+# If the sample size is greater than or equal to 10 and the number of species in all samples follows a normal distribution, or if the sample size is less than 10, then use the average number of species in all samples as the representative species count T, and extract the species with prevalence up to T as the representative species.
+# If the sample size is greater than or equal to 10 and the number of species in all samples does not follow a normal distribution, then use the median number of species in all samples as the richness sampling number T, and extract the species with prevalence up to T as the representative species.
+Extract_representative_species = function(indata,group_df,Sample_col = "SampleID",group_level){
+  indata = check_and_set_rownames(indata)
+  colnames(group_df)[colnames(group_df)==Sample_col] = "SampleID"
+  colnames(group_df)[colnames(group_df)==group_level] = "levels"
+  group_list = unique(group_df$levels)
+  outdata = data.frame(taxid = rownames(indata))
+  library(nortest)
+  for (i in group_list){
+    message(paste0("Currently processing:",i))
+    tempdf=indata[ ,c(group_df[group_df$levels==i, ]$SampleID),drop = FALSE]
+    prevalence_df = data.frame(taxid = rownames(tempdf),prevalence = rowSums(tempdf))
+    sample_num = c(colSums(tempdf))
+    print(paste0("The sample size is:",length(sample_num)))
+    names(sample_num) = NULL
+    if (length(sample_num)>=10){
+      ifnormal = ad.test(sample_num)$p.value
+      if (ifnormal>0.05){
+        print("The number of species is normally distributed, using the average value.")
+        sample_mean = as.integer(mean(sample_num))
+      }else{
+        print("The number of species is not normally distributed, and the median is used.")
+        sample_mean = as.integer(median(sample_num, na.rm = FALSE))
+      }
+    }else{
+      print("If the sample size is less than 10, use the average value.")
+      sample_mean = as.integer(mean(sample_num))
+    }
+    result <- data.frame(
+      taxid = rownames(tempdf),
+      Presence = 0
+    )
+    high_taxid <- prevalence_df %>%
+      arrange(desc(prevalence)) %>% 
+      slice_head(n = sample_mean) %>% 
+      pull(taxid) %>% 
+      as.character()  
+    result$Presence[result$taxid%in%high_taxid]=1
+    colnames(result)[2] <- i
+    outdata = merge(outdata,result,by= "taxid")
+  }
+  return(outdata)
+}
+PS_taxid_01_16s = Extract_representative_species(sample_taxid_01_16s,metadata_16s,"SampleID","Species")
+write.table(PS_taxid_01_16s,file = "standard/PS_taxid_01_16s.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+PS_taxid_01_its = Extract_representative_species(sample_taxid_01_its,metadata_its,"SampleID","Species")
+write.table(PS_taxid_01_its,file = "standard/PS_taxid_01_its.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+```
+
+
+#Add popularity rate, generalist-specialist classification and function prediction results to the tax table
+```{r}
+rm(list = ls())
+library(data.table)
+library(tibble)
+library(tidyr)
+library(dplyr)
+library(vegan)
+library(ggplot2)
+source("Tools.R")
+PS_taxid_01_16s = read.delim("standard/PS_taxid_01_16s.txt")
+prevalence_Species_16s = data.frame(taxid = PS_taxid_01_16s$taxid,
+                                    prevalence_s = rowSums(PS_taxid_01_16s[ ,-1]))
+taxonomy_16s = read.delim("raw/taxonomy_16s.txt")
+taxonomy_16s_extended = merge(taxonomy_16s,prevalence_Species_16s,by = "taxid",all.x = TRUE)
+
+
+PS_taxid_01_its = read.delim("standard/PS_taxid_01_its.txt")
+prevalence_Species_its = data.frame(taxid = PS_taxid_01_its$taxid,
+                                    prevalence_s = rowSums(PS_taxid_01_its[ ,-1]))
+
+taxonomy_its = read.delim("raw/taxonomy_its.txt")
+taxonomy_its_extended = merge(taxonomy_its,prevalence_Species_its,by = "taxid",all.x = TRUE)
+
+
+
+
+PS_taxid_01_16s = column_to_rownames(PS_taxid_01_16s,"taxid")
+PS_taxid_01_16s = PS_taxid_01_16s[rowSums(PS_taxid_01_16s)!=0,]
+PS_taxid_01_16s = PS_taxid_01_16s[rownames(PS_taxid_01_16s)!="Unassigned",]
+
+
+PS_taxid_01_its = column_to_rownames(PS_taxid_01_its,"taxid")
+PS_taxid_01_its = PS_taxid_01_its[rowSums(PS_taxid_01_its)!=0,]
+PS_taxid_01_its = PS_taxid_01_its[rownames(PS_taxid_01_its)!="Unassigned",]
+
+
+GOS_result_16s_s = classify_gos(PS_taxid_01_16s,10000)
+GOS_result_its_s = classify_gos(PS_taxid_01_its,10000)
+
+GOS_type_16s_s = GOS_result_16s_s[[1]]
+colnames(GOS_type_16s_s)[2] = "GOS_s"
+
+GOS_type_its_s = GOS_result_its_s[[1]]
+colnames(GOS_type_its_s)[2] = "GOS_s"
+
+taxonomy_16s_extended = merge(taxonomy_16s_extended, GOS_type_16s_s, by = "taxid",all.x = TRUE)
+
+taxonomy_16s_extended$GOS_s[is.na(taxonomy_16s_extended$GOS_s)] = "comm"
+taxonomy_its_extended = merge(taxonomy_its_extended, GOS_type_its_s, by = "taxid",all.x = TRUE)
+taxonomy_its_extended$GOS_s[is.na(taxonomy_its_extended$GOS_s)] = "comm"
+dir.create("result/GOS")
+dist_plot = function(dist_df,out_dir){
+  #去除双0行
+  dist_df = dist_df[dist_df$real_num != 0 | dist_df$pre_num != 0, ]
+  dist_df = dist_df[dist_df$real_num>=10,]
+  df_long <- pivot_longer(dist_df, cols = c(real_num, pre_num), names_to = "variable", values_to = "value")
+  df_long$Frequency = factor(df_long$Frequency)
+  # 绘制簇状柱形图
+  p = ggplot(df_long, aes(x = Frequency, y = value, fill = variable)) +
+    geom_bar(stat = "identity", position = position_dodge()) +
+    labs(x = "Prevalence", y = "Number") +
+    scale_fill_manual(values = c("real_num" = "#f7e09b", "pre_num" = "#517d7e"), # 自定义颜色
+                      labels = c("Predicted", "Realistic")) + # 自定义图例标签
+    theme_classic() + 
+    theme(
+      legend.position = "top" ,
+      panel.background = element_blank(), 
+      axis.text.x = element_text(size = 14, color = "black"),
+      axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+      axis.text.y = element_text(size = 14, color = "black", angle = 0), 
+      axis.title.y = element_text(size = 14, color = "black", face = "bold"), 
+      legend.title = element_text(size = 14, color = "black"), 
+      legend.text = element_text(size = 14, color = "black"), 
+    )
+  ggsave(out_dir,p,width = 10,height = 6)
+  return(p)
+}
+dist_plot(GOS_result_16s_s[[2]],"result/GOS/real_pre_16s_s.pdf")
+dist_plot(GOS_result_its_s[[2]],"result/GOS/real_pre_its_s.pdf")
+
+
+### 汇总功能预测数据到tax表=====================================================
+funguild_result = read.delim("raw/funguild_result.txt")
+taxonomy_its_extended = merge(taxonomy_its_extended,funguild_result,by.x = "taxid",by.y = "OTU_ID",all.x = TRUE)
+taxonomy_its_extended_cleaned = replace_nas(taxonomy_its_extended)
+write.table(taxonomy_its_extended_cleaned,file = "standard/taxonomy_its_extended.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+ko_data_genome = fread("raw/ko_data_genome.txt")
+ko_data_genome = column_to_rownames(ko_data_genome,"taxid")
+ko_data_genome_01 = ko_data_genome
+ko_data_genome_01[ko_data_genome_01 != 0] = 1
+ko_sum_genome = data.frame(taxid = rownames(ko_data_genome),
+                            ko_sum_genome = rowSums(ko_data_genome),
+                            ko_richness_genome = rowSums(ko_data_genome_01))
+taxonomy_16s_extended = merge(taxonomy_16s_extended,ko_sum_genome,by = "taxid",all.x = TRUE)
+
+bugbase_result= read.delim("raw/bugbase_result.txt")
+taxonomy_16s_extended = merge(taxonomy_16s_extended,bugbase_result,by = "taxid", all.x = TRUE)
+taxonomy_16s_extended = taxonomy_16s_extended %>%
+  mutate(Aerobic_type = ifelse(Aerobic=="TRUE","Aerobic",ifelse(Anaerobic=="TRUE","Anaerobic",ifelse(Facultatively_Anaerobic=="TRUE","Facultatively_Anaerobic","Unknown")))) %>%
+  mutate(Gram_type = ifelse(Gram_Positive=="TRUE","Positive",ifelse(Gram_Negative=="TRUE","Negative","Unknown")))
+taxonomy_16s_extended_cleaned <- replace_nas(taxonomy_16s_extended)
+write.table(taxonomy_16s_extended_cleaned,file = "standard/taxonomy_16s_extended.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+table(taxonomy_16s_extended_cleaned$GOS_s)
+```
+# Calculate the fusion prevalence rate of microbial genera
+```{r}
+rm(list = ls())
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+source("Tools.R")
+merged_preavalence_plot = function(indata,xlable,out_dir){
+  indata = indata[!rownames(indata)%in%c("Unassigned","Incertae Sedis"),]
+  indata = indata[c(1:30),]
+  rownames(indata)[which(rownames(indata) == "Burkholderia-Caballeronia-Paraburkholderia")] <- "Burkholderia"
+  colnames(indata)[2] = "sum"
+  ymin = min(indata$sum)-5
+  ymax = max(indata$sum)+3
+  p = ggplot(indata, aes(x = reorder(rownames(indata), -sum), y = sum)) +
+    geom_col(aes(fill = sum)) + 
+    scale_fill_gradient(low = "#93CEDF", high = "#E4A644") + 
+    geom_text(aes(label = sum), vjust = -0.5, size = 4) +  
+    labs(x = xlable, y = "Merged Prevalence",fill = "Merged\nPrevalence") +
+    theme_classic() + 
+    coord_cartesian(ylim = c(ymin, ymax))+
+    theme(
+      panel.background = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+      axis.text.x = element_text(size = 14, color = "black", angle = -45, hjust = 0, vjust = 1),
+      axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+      axis.text.y = element_text(size = 14, color = "black", angle = 0), 
+      axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+      legend.title = element_text(size = 14, color = "black"), 
+      legend.text = element_text(size = 12, color = "black"), 
+      plot.margin = margin(t = 10,r = 20,b = 10,l = 10,unit = "pt")
+    )
+  ggsave(out_dir,p,width = 12,height = 5)
+  return(p)
+}
+dir.create("result/merge_prevalence")
+metadata_16s = read.delim("raw/metadata_16s.txt")
+metadata_its = read.delim("raw/metadata_its.txt")
+taxonomy_16s = read.delim("raw/taxonomy_16s.txt")
+taxonomy_its = read.delim("raw/taxonomy_its.txt")
+PS_taxid_01_16s = read.delim("standard/PS_taxid_01_16s.txt")
+PS_taxid_01_its = read.delim("standard/PS_taxid_01_its.txt")
+
+# 计算融合流行率
+PS_MG_01_16s = merge_datafame(datafame = PS_taxid_01_16s,
+                              row_group = taxonomy_16s[ ,c("taxid","Genus")],
+                              row_method = "sum")
+PS_MG_01_16s[PS_MG_01_16s != 0] = 1
+
+
+merged_preavalence_PS_16S = data.frame(Genus = rownames(PS_MG_01_16s),
+                                       prevalence_s = rowSums(PS_MG_01_16s))
+merged_preavalence_PS_16S = merged_preavalence_PS_16S[order(merged_preavalence_PS_16S$prevalence_s,decreasing = TRUE),]
+merged_preavalence_plot(merged_preavalence_PS_16S,"Bacterial Species","result/merge_prevalence/merged_preavalence_PS_16S.pdf")
+write.table(merged_preavalence_PS_16S,file = "result/merge_prevalence/merged_preavalence_PS_16S.txt",
+            quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+
+PS_MG_01_its = merge_datafame(datafame = PS_taxid_01_its,
+                              row_group = taxonomy_its[ ,c("taxid","Genus")],
+                              row_method = "sum")
+PS_MG_01_its[PS_MG_01_its != 0] = 1
+
+
+merged_preavalence_PS_its = data.frame(Genus = rownames(PS_MG_01_its),
+                                       prevalence_s = rowSums(PS_MG_01_its))
+merged_preavalence_PS_its = merged_preavalence_PS_its[order(merged_preavalence_PS_its$prevalence_s,decreasing = TRUE),]
+merged_preavalence_plot(merged_preavalence_PS_its,"Fungi Species","result/merge_prevalence/merged_preavalence_PS_its.pdf")
+write.table(merged_preavalence_PS_its,file = "result/merge_prevalence/merged_preavalence_PS_its.txt",
+            quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+
+#看看融合流行率属与通才的关系
+taxonomy_16s_extended = read.delim("standard/taxonomy_16s_extended.txt")
+taxonomy_its_extended = read.delim("standard/taxonomy_its_extended.txt")
+topn = 20
+merge_top_16s = merged_preavalence_PS_16S[!rownames(merged_preavalence_PS_16S)%in%c("Unassigned","Incertae Sedis"),]
+merge_top_16s = merge_top_16s[c(1:topn),]
+rownames(merge_top_16s)[which(rownames(merge_top_16s) == "Burkholderia-Caballeronia-Paraburkholderia")] <- "Burkholderia"
+merge_top_its = merged_preavalence_PS_its[!rownames(merged_preavalence_PS_its)%in%c("Unassigned","Incertae Sedis"),]
+merge_top_its = merge_top_its[c(1:topn),]
+g_gensu_16s = unique(taxonomy_16s_extended$Genus[taxonomy_16s_extended$GOS_s=="generalist"])
+g_gensu_its = unique(taxonomy_its_extended$Genus[taxonomy_its_extended$GOS_s=="generalist"])
+length(intersect(g_gensu_16s,merge_top_16s$Genus))
+length(intersect(g_gensu_its,merge_top_its$Genus))
+
+```
+
+# Construction of the evolutionary tree and annotation file for generalists and specialists of microorganisms
+
+# Note: For the 16s sequences, we use the server to build the tree, and the processed tree files are placed in the "raw" folder
+# The following code also provides the Linux command for building the evolutionary tree. It is necessary to install software such as muscle, trimal, mafft, and FastTree in advance and then run it in the Linux environment
+# The fungal tree was constructed based on the species classification of microorganisms, containing only the topological structure of species classification and not involving the calculation of genetic distances.
+
+```{r}
+rm(list = ls())
+source("Tools.R")
+dir.create("result/GOS/tree_g_16s")
+dir.create("result/GOS/tree_s_16s")
+dir.create("result/GOS/tree_g_its")
+dir.create("result/GOS/tree_s_its")
+
+
+taxonomy_16s_extended = read.delim("standard/taxonomy_16s_extended.txt")
+taxonomy_its_extended = read.delim("standard/taxonomy_its_extended.txt")
+annotation_g_16s = taxonomy_16s_extended[taxonomy_16s_extended$GOS_s=="generalist",]
+annotation_s_16s = taxonomy_16s_extended[taxonomy_16s_extended$GOS_s=="specialist",]
+annotation_g_its = taxonomy_its_extended[taxonomy_its_extended$GOS_s=="generalist",]
+annotation_s_its = taxonomy_its_extended[taxonomy_its_extended$GOS_s=="specialist",]
+
+write.table(annotation_g_16s,file = "result/GOS/tree_g_16s/annotation_g_16s.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+write.table(annotation_s_16s,file = "result/GOS/tree_s_16s/annotation_s_16s.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+write.table(annotation_g_its,file = "result/GOS/tree_g_its/annotation_g_its.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+write.table(annotation_s_its,file = "result/GOS/tree_s_its/annotation_s_its.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+taxid_g_16s = annotation_g_16s$taxid
+taxid_s_16s = annotation_s_16s$taxid
+
+library(Biostrings)
+silva_sequences <- readDNAStringSet("db/SILVA_138.2_DNA.fa")
+get_target_seq(taxid_g_16s,silva_sequences,"result/GOS/tree_g_16s/tree_g_16s.fa")
+get_target_seq(taxid_s_16s,silva_sequences,"result/GOS/tree_s_16s/tree_s_16s.fa")
+############################################################
+# # Use high-performance servers for tree building
+# muscle -align tree_g_16s.fa -output tree_g_16s_muscle.fa
+# trimal -in tree_g_16s_muscle.fa \
+#   -out tree_g_16s_muscle_trimmed.fa \
+#   -automated1
+# mkdir -p iqtree_g
+# iqtree3 \
+#   -s tree_g_16s_muscle_trimmed.fa \
+#   -m MFP \
+#   -B 1000 \
+#   -T 8 \
+#   --prefix iqtree_g/tree_g_16s
+# 
+# mafft --auto --thread 100 tree_s_16s.fa > tree_s_16s_mafft.fa
+# trimal -in tree_s_16s_mafft.fa \
+#   -out tree_s_16s_mafft_trimmed.fa \
+#   -automated1
+# FastTreeMP -nt -gtr -gamma tree_s_16s_mafft_trimmed.fa > tree_s_16s_FastTree.tree
+##########################################################
+
+# Construct a classification tree for fungal species
+class_tree(annotation_g_its,"result/GOS/tree_g_its/tree_g_its.nwk","taxid")
+class_tree(annotation_s_its,"result/GOS/tree_s_its/tree_s_its.nwk","taxid")
+
+```
+
+# Create the iTol annotation file
+# Preparation of bacterial generalist tree annotation file
+```{r}
+rm(list = ls())
+source("Tools.R")
+library(itol.toolkit)
+library(dplyr)
+library(data.table)
+library(ape)
+library(stringr)
+library(tidyr)
+#开始构建树注释文件(通才树)
+annotation = read.delim("result/GOS/tree_g_16s/annotation_g_16s.txt")
+tree <- read.tree("raw/tree_g_16s_iqtree_itol.nwk")
+tree_label = tree$tip.label
+name_df = data.frame(index = c(1:length(tree_label)),
+                     taxid = tree_label)
+annotation = merge(name_df,annotation,by="taxid")
+annotation = annotation %>% arrange(index)
+
+
+colorlist1 = c("#99C2C8","#DA7289","#9EB395","#EBD7A5","#C1D2E2",
+               "#099396","#016074","#E9BDA0","#9D2227","#EE9B01",
+               "#3E4069","#A23F25","#517D7E","#CA820A","#808DAA",
+               "#E5A984","#552379","#B24057","#A49BC6","#F7E09B",
+               "#93CEDF","#D5ABBF","#846992","#D98267","#73BEA0",
+               "#E4A644","#BC9F77","#CB3F48","#A94B32","#8A926B",
+               "#9B443B","#7B6D4A","#4B5B74","#C6803A","#CB4047")
+
+colorlist2 = c("#FCB366","#FE816F","#90D7C7","#93BCD0","#AF3F4F",
+               "#E5C28C","#CA8BB6","#1A6C92","#EAB46E","#8CC3BD",
+               "#8F9EC5","#6C77B5","#138A8E","#4B9D77","#8E60A8",
+               "#DC6D73","#B2B896","#E97DAE","#FB7A64","#EDCE35",
+               "#99C2C8","#DA7289","#B24057","#EBD7A5","#92D2C1",
+               "#4E56AB","#0FBFBC","#E9A564","#ADD565","#ADADAD",
+               "#F3BB34","#F8AD9A","#5163B5","#613767","#56B394")
+
+hub <- create_hub(tree = tree)
+#制作Phylum色环
+#配置颜色
+unique_Phylum = unique(annotation$Phylum)
+colorlist_Phylum = colorlist2[1:length(unique_Phylum)]
+Phylum_color_map = data.frame(Phylum = unique_Phylum,
+                             Phylum_color = colorlist_Phylum)
+create_color_legend(Phylum_color_map, save_path = "result/GOS/tree_g_16s/Phylum_legend.pdf", shape = "square", 
+                                layout = "col", n = 1, title = "Phylum", 
+                                label_size = 4, title_size = 6, ifsave = TRUE)
+Phylum_color_map$Phylum_color[Phylum_color_map$Phylum=="Other"] = "#eeeeee"
+unit_Phylum <- create_unit(data = merge(annotation[ ,c("taxid","Phylum")],Phylum_color_map,by="Phylum")[ ,c("taxid","Phylum","Phylum_color")],
+                          key = "Phylum",
+                          type = "DATASET_COLORSTRIP",
+                          tree = tree)
+unit_Phylum@common_themes$legend$horizontal = NULL #调整图例为竖向
+# unit_Phylum@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Phylum
+
+
+#制作Class色环
+#配置颜色
+unique_Class = unique(annotation$Class)
+colorlist_Class = colorlist1[1:length(unique_Class)]
+Class_color_map = data.frame(Class = unique_Class,
+                             Class_color = colorlist_Class)
+create_color_legend(Class_color_map, save_path = "result/GOS/tree_g_16s/Class_legend.pdf", shape = "square", 
+                                layout = "row", n = 3, title = "Class", 
+                                label_size = 4, title_size = 6, ifsave = TRUE)
+Class_color_map$Class_color[Class_color_map$Class=="Other"] = "#eeeeee"
+unit_Class <- create_unit(data = merge(annotation[ ,c("taxid","Class")],Class_color_map,by="Class")[ ,c("taxid","Class","Class_color")],
+                          key = "Class",
+                          type = "DATASET_COLORSTRIP",
+                          tree = tree)
+unit_Class@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Class@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Class
+
+
+#制作好氧/厌氧色环
+unique_Aerobic_type = sort(unique(annotation$Aerobic_type))
+
+colorlist_Aerobic_type = c("#99C2C8","#D4693F","#E4A644","#eeeeee")
+Aerobic_type_color_map = data.frame(Aerobic_type = unique_Aerobic_type,
+                                    Aerobic_type_color = colorlist_Aerobic_type)
+unit_Aerobic <- create_unit(data = merge(annotation[ ,c("taxid","Aerobic_type")],Aerobic_type_color_map,by="Aerobic_type")[ ,c("taxid","Aerobic_type","Aerobic_type_color")],
+                            key = "Aerobic_type", 
+                            type = "DATASET_COLORSTRIP", 
+                            tree = tree)
+unit_Aerobic@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Aerobic@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Aerobic
+#制作生物膜色环
+unique_Forms_Biofilms = sort(unique(annotation$Forms_Biofilms))
+colorlist_Forms_Biofilms = c("#E8C2D9","#846992","#eeeeee")
+Forms_Biofilms_color_map = data.frame(Forms_Biofilms = unique_Forms_Biofilms,
+                                      Forms_Biofilms_color = colorlist_Forms_Biofilms)
+unit_Forms_Biofilms <- create_unit(data = merge(annotation[ ,c("taxid","Forms_Biofilms")],Forms_Biofilms_color_map,by="Forms_Biofilms")[ ,c("taxid","Forms_Biofilms","Forms_Biofilms_color")],
+                                   key = "Forms_Biofilms", 
+                                   type = "DATASET_COLORSTRIP",
+                                   tree = tree)
+unit_Forms_Biofilms@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Forms_Biofilms@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Forms_Biofilms
+#制作格兰仕阴阳性色环
+unique_Gram_type = unique(annotation$Gram_type)
+colorlist_Gram_type = c("#A1B1CB","#4B5B74","#eeeeee")
+Gram_type_color_map = data.frame(Gram_type = unique_Gram_type,
+                                 Gram_type_color = colorlist_Gram_type)
+unit_Gram_type <- create_unit(data = merge(annotation[ ,c("taxid","Gram_type")],Gram_type_color_map,by="Gram_type")[ ,c("taxid","Gram_type","Gram_type_color")],
+                              key = "Gram_type", 
+                              type = "DATASET_COLORSTRIP", 
+                              tree = tree)
+unit_Gram_type@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Gram_type@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Gram_type
+
+#制作流行度柱状图
+prevalence_s = annotation[ ,c("taxid","prevalence_s")]
+prevalence_s$prevalence_s[prevalence_s$prevalence_s=="Unknown"] = 0
+prevalence_s$prevalence_s = as.numeric(prevalence_s$prevalence_s)
+unit_prevalence_s <- create_unit(data = prevalence_s,
+                       key = "Prevalence",
+                       type = "DATASET_SIMPLEBAR",
+                       tree = tree)
+unit_prevalence_s@profile$color = "#1A6C92"
+unit_prevalence_s@specific_themes$basic_plot$width = 250
+unit_prevalence_s@specific_themes$basic_plot$dataset_scale = c(10,20,30,40,50)
+hub <- hub + unit_prevalence_s
+dir.create("result/GOS/tree_g_16s/itol_annotation")
+write_hub(hub, "result/GOS/tree_g_16s/itol_annotation")
+
+# 常见属的小柱状图
+library(ggplot2)
+library(dplyr)
+freq_pre_df = as.data.frame(table(annotation$Genus))
+freq_pre_df$pre = freq_pre_df$Freq/sum(freq_pre_df$Freq)*100
+freq_pre_df = freq_pre_df[freq_pre_df$Var1!="Incertae Sedis",]
+colnames(freq_pre_df)[1] = "Genus"
+top10_df <- freq_pre_df %>%
+  arrange(desc(pre)) %>% 
+  slice_head(n = 10) %>% 
+  mutate(Genus = factor(Genus, levels = rev(unique(Genus))))
+
+ggplot(top10_df, aes(x = Genus, y = pre, fill = pre)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(round(pre, 2), "%")), 
+            hjust = -0.1, size = 4, color = "black") +
+  scale_fill_gradient(low = "#E0F2FF", high = "#1F4A7A") +
+  ggtitle("Top 10 Genus") +
+  coord_flip() +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    legend.position = "none",  
+    axis.title = element_blank(),  
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(), 
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  ) +
+  expand_limits(y = max(top10_df$pre) * 1.15)
+ggsave("result/GOS/tree_g_16s/top10_genus.pdf",width = 3,height = 3)
+```
+
+# Preparation of bacterial specialist tree annotation file
+```{r}
+rm(list = ls())
+source("Tools.R")
+library(itol.toolkit)
+library(dplyr)
+library(data.table)
+library(ape)
+library(stringr)
+library(tidyr)
+#开始构建树注释文件(通才树)
+annotation = read.delim("result/GOS/tree_s_16s/annotation_s_16s.txt")
+annotation <- annotation %>%
+  group_by(Phylum) %>%
+  mutate(Phylum_count = n()) %>%
+  ungroup() %>%
+  arrange(desc(Phylum_count)) %>%
+  mutate(Phylum_rank = dense_rank(desc(Phylum_count))) %>%
+  mutate(Phylum_simp = ifelse(Phylum_rank > 20, "Other", Phylum)) %>%
+  select(-Phylum_count, -Phylum_rank)
+tree <- read.tree("raw/tree_s_16s_fasttree_itol.nwk")
+tree_label = tree$tip.label
+name_df = data.frame(index = c(1:length(tree_label)),
+                     taxid = tree_label)
+annotation = merge(name_df,annotation,by="taxid")
+annotation = annotation %>% arrange(index)
+
+
+colorlist2 = c("#FCB366","#FE816F","#90D7C7","#93BCD0","#AF3F4F",
+               "#E5C28C","#CA8BB6","#1A6C92","#EAB46E","#8CC3BD",
+               "#8F9EC5","#6C77B5","#138A8E","#4B9D77","#8E60A8",
+               "#DC6D73","#B2B896","#E97DAE","#FB7A64","#EDCE35",
+               "#99C2C8","#DA7289","#B24057","#EBD7A5","#92D2C1",
+               "#4E56AB","#0FBFBC","#E9A564","#ADD565","#ADADAD",
+               "#F3BB34","#F8AD9A","#5163B5","#613767","#56B394")
+
+hub <- create_hub(tree = tree)
+#制作Phylum色环
+#配置颜色
+unique_Phylum_simp = unique(annotation$Phylum_simp)
+unique_Phylum_simp = c(unique_Phylum_simp[unique_Phylum_simp!="Other"],"Other")
+colorlist_Phylum_simp = colorlist2[1:length(unique_Phylum_simp)]
+Phylum_simp_color_map = data.frame(Phylum_simp = unique_Phylum_simp,
+                             Phylum_simp_color = colorlist_Phylum_simp)
+Phylum_simp_color_map$Phylum_simp_color[Phylum_simp_color_map$Phylum_simp=="Other"] = "#eeeeee"
+
+create_color_legend(Phylum_simp_color_map, save_path = "result/GOS/tree_s_16s/Phylum_simp_legend.pdf", shape = "square", 
+                                layout = "row", n = 3, title = "Phylum_simp", 
+                                label_size = 4, title_size = 6, ifsave = TRUE)
+
+unit_Phylum_simp <- create_unit(data = merge(annotation[ ,c("taxid","Phylum_simp")],Phylum_simp_color_map,by="Phylum_simp")[ ,c("taxid","Phylum_simp","Phylum_simp_color")],
+                          key = "Phylum",
+                          type = "DATASET_COLORSTRIP",
+                          tree = tree)
+unit_Phylum_simp@common_themes$legend$horizontal = NULL #调整图例为竖向
+# unit_Phylum_simp@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Phylum_simp
+
+
+#制作好氧/厌氧色环
+unique_Aerobic_type = sort(unique(annotation$Aerobic_type))
+
+colorlist_Aerobic_type = c("#99C2C8","#D4693F","#E4A644","#eeeeee")
+Aerobic_type_color_map = data.frame(Aerobic_type = unique_Aerobic_type,
+                                    Aerobic_type_color = colorlist_Aerobic_type)
+unit_Aerobic <- create_unit(data = merge(annotation[ ,c("taxid","Aerobic_type")],Aerobic_type_color_map,by="Aerobic_type")[ ,c("taxid","Aerobic_type","Aerobic_type_color")],
+                            key = "Aerobic_type", 
+                            type = "DATASET_COLORSTRIP", 
+                            tree = tree)
+unit_Aerobic@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Aerobic@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Aerobic
+#制作生物膜色环
+unique_Forms_Biofilms = sort(unique(annotation$Forms_Biofilms))
+colorlist_Forms_Biofilms = c("#E8C2D9","#846992","#eeeeee")
+Forms_Biofilms_color_map = data.frame(Forms_Biofilms = unique_Forms_Biofilms,
+                                      Forms_Biofilms_color = colorlist_Forms_Biofilms)
+unit_Forms_Biofilms <- create_unit(data = merge(annotation[ ,c("taxid","Forms_Biofilms")],Forms_Biofilms_color_map,by="Forms_Biofilms")[ ,c("taxid","Forms_Biofilms","Forms_Biofilms_color")],
+                                   key = "Forms_Biofilms", 
+                                   type = "DATASET_COLORSTRIP",
+                                   tree = tree)
+unit_Forms_Biofilms@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Forms_Biofilms@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Forms_Biofilms
+#制作格兰仕阴阳性色环
+unique_Gram_type = unique(annotation$Gram_type)
+colorlist_Gram_type = c("#4B5B74","#eeeeee","#A1B1CB")
+Gram_type_color_map = data.frame(Gram_type = unique_Gram_type,
+                                 Gram_type_color = colorlist_Gram_type)
+unit_Gram_type <- create_unit(data = merge(annotation[ ,c("taxid","Gram_type")],Gram_type_color_map,by="Gram_type")[ ,c("taxid","Gram_type","Gram_type_color")],
+                              key = "Gram_type", 
+                              type = "DATASET_COLORSTRIP", 
+                              tree = tree)
+unit_Gram_type@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Gram_type@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Gram_type
+
+dir.create("result/GOS/tree_s_16s/itol_annotation")
+write_hub(hub, "result/GOS/tree_s_16s/itol_annotation")
+```
+
+```{r}
+# Preparation of fungal generalist tree annotation file
+rm(list = ls())
+source("Tools.R")
+library(itol.toolkit)
+library(dplyr)
+library(data.table)
+library(ape)
+library(stringr)
+library(tidyr)
+#开始构建树注释文件(通才树)
+annotation = read.delim("result/GOS/tree_g_its/annotation_g_its.txt")
+tree <- read.tree("raw/tree_g_its_itol.nwk")
+tree_label = tree$tip.label
+name_df = data.frame(index = c(1:length(tree_label)),
+                     taxid = tree_label)
+annotation = merge(name_df,annotation,by="taxid")
+annotation = annotation %>% 
+  arrange(index)%>%
+  mutate(Saprotrophs = ifelse(general_saprotrophs == "TRUE"|specialized_saprotrophs == "TRUE","TRUE",
+                              ifelse(general_saprotrophs == "FALSE" & specialized_saprotrophs == "FALSE","FALSE","Unknown")))
+
+colorlist1 = c("#99C2C8","#DA7289","#9EB395","#EBD7A5","#C1D2E2",
+               "#099396","#016074","#E9BDA0","#9D2227","#EE9B01",
+               "#3E4069","#A23F25","#517D7E","#CA820A","#808DAA",
+               "#E5A984","#552379","#B24057","#A49BC6","#F7E09B",
+               "#93CEDF","#D5ABBF","#846992","#D98267","#73BEA0",
+               "#E4A644","#BC9F77","#CB3F48","#A94B32","#8A926B",
+               "#9B443B","#7B6D4A","#4B5B74","#C6803A","#CB4047")
+colorlist2 = c("#FCB366","#FE816F","#90D7C7","#93BCD0","#AF3F4F",
+               "#E5C28C","#CA8BB6","#1A6C92","#EAB46E","#8CC3BD",
+               "#8F9EC5","#6C77B5","#138A8E","#4B9D77","#8E60A8",
+               "#DC6D73","#B2B896","#E97DAE","#FB7A64","#EDCE35",
+               "#99C2C8","#DA7289","#B24057","#EBD7A5","#92D2C1",
+               "#4E56AB","#0FBFBC","#E9A564","#ADD565","#ADADAD",
+               "#F3BB34","#F8AD9A","#5163B5","#613767","#56B394")
+
+hub <- create_hub(tree = tree)
+
+#制作Phylum色环
+#配置颜色
+unique_Phylum = unique(annotation$Phylum)
+unique_Phylum = c(unique_Phylum[unique_Phylum!="Unassigned"],"Unassigned")
+colorlist_Phylum = colorlist1[1:length(unique_Phylum)]
+Phylum_color_map = data.frame(Phylum = unique_Phylum,
+                             Phylum_color = colorlist_Phylum)
+Phylum_color_map$Phylum_color[Phylum_color_map$Phylum=="Unassigned"] = "#eeeeee"
+create_color_legend(Phylum_color_map, save_path = "result/GOS/tree_g_its/Phylum_legend.pdf", shape = "square", 
+                                layout = "row", n = 1, title = "Phylum", 
+                                label_size = 4, title_size = 6, ifsave = TRUE)
+
+unit_Phylum <- create_unit(data = merge(annotation[ ,c("taxid","Phylum")],Phylum_color_map,by="Phylum")[ ,c("taxid","Phylum","Phylum_color")],
+                          key = "Phylum",
+                          type = "DATASET_COLORSTRIP",
+                          tree = tree)
+unit_Phylum@common_themes$legend$horizontal = NULL #调整图例为竖向
+# unit_Phylum@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Phylum
+
+
+#制作Class色环
+#配置颜色
+unique_Class = unique(annotation$Class)
+unique_Class = c(unique_Class[unique_Class!="Unassigned"],"Unassigned")
+colorlist_Class = colorlist2[1:length(unique_Class)]
+Class_color_map = data.frame(Class = unique_Class,
+                             Class_color = colorlist_Class)
+Class_color_map$Class_color[Class_color_map$Class=="Unassigned"] = "#eeeeee"
+create_color_legend(Class_color_map, save_path = "result/GOS/tree_g_its/Class_legend.pdf", shape = "square", 
+                                layout = "row", n = 2, title = "Class", 
+                                label_size = 4, title_size = 6, ifsave = TRUE)
+
+unit_Class <- create_unit(data = merge(annotation[ ,c("taxid","Class")],Class_color_map,by="Class")[ ,c("taxid","Class","Class_color")],
+                          key = "Class",
+                          type = "DATASET_COLORSTRIP",
+                          tree = tree)
+unit_Class@common_themes$legend$horizontal = NULL #调整图例为竖向
+# unit_Class@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Class
+#给颜色加alpha
+add_alpha <- function(color, alpha) {
+  # 将16进制颜色转为RGB
+  rgb_col <- col2rgb(color)
+  
+  # 返回带alpha的颜色
+  return(rgb(rgb_col[1,], rgb_col[2,], rgb_col[3,], 
+             alpha = alpha * 255, maxColorValue = 255))
+}
+
+#制作mycorrhizal色环
+unique_mycorrhizal = rev(sort(unique(annotation$mycorrhizal)))
+colorlist_mycorrhizal = c("#eeeeee",add_alpha("#016074",0.6))
+mycorrhizal_color_map = data.frame(mycorrhizal = unique_mycorrhizal,
+                                 mycorrhizal_color = colorlist_mycorrhizal)
+unit_mycorrhizal <- create_unit(data = merge(annotation[ ,c("taxid","mycorrhizal")],mycorrhizal_color_map,by="mycorrhizal")[ ,c("taxid","mycorrhizal","mycorrhizal_color")],
+                              key = "Mycorrhizal", 
+                              type = "DATASET_COLORSTRIP", 
+                              tree = tree)
+unit_mycorrhizal@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_mycorrhizal@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_mycorrhizal
+
+#制作plant_associates色环
+unique_plant_associates = rev(sort(unique(annotation$plant_associates)))
+colorlist_plant_associates = c("#eeeeee","#3E4069",add_alpha("#3E4069",0.4))
+plant_associates_color_map = data.frame(plant_associates = unique_plant_associates,
+                                   plant_associates_color = colorlist_plant_associates)
+unit_plant_associates <- create_unit(data = merge(annotation[ ,c("taxid","plant_associates")],plant_associates_color_map,by="plant_associates")[ ,c("taxid","plant_associates","plant_associates_color")],
+                                key = "Plant_associates", 
+                                type = "DATASET_COLORSTRIP", 
+                                tree = tree)
+unit_plant_associates@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_plant_associates@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_plant_associates
+
+#制作Symbiotroph色环
+unique_Symbiotroph = rev(sort(unique(annotation$Symbiotroph)))
+colorlist_Symbiotroph = c("#eeeeee","#099396",add_alpha("#099396",0.4))
+Symbiotroph_color_map = data.frame(Symbiotroph = unique_Symbiotroph,
+                                   Symbiotroph_color = colorlist_Symbiotroph)
+unit_Symbiotroph <- create_unit(data = merge(annotation[ ,c("taxid","Symbiotroph")],Symbiotroph_color_map,by="Symbiotroph")[ ,c("taxid","Symbiotroph","Symbiotroph_color")],
+                                key = "Symbiotroph", 
+                                type = "DATASET_COLORSTRIP", 
+                                tree = tree)
+unit_Symbiotroph@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Symbiotroph@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Symbiotroph
+
+#制作plant_pathogens色环
+unique_plant_pathogens = rev(sort(unique(annotation$plant_pathogens)))
+colorlist_plant_pathogens = c("#eeeeee","#9D2227",add_alpha("#9D2227",0.4))
+plant_pathogens_color_map = data.frame(plant_pathogens = unique_plant_pathogens,
+                                 plant_pathogens_color = colorlist_plant_pathogens)
+unit_plant_pathogens <- create_unit(data = merge(annotation[ ,c("taxid","plant_pathogens")],plant_pathogens_color_map,by="plant_pathogens")[ ,c("taxid","plant_pathogens","plant_pathogens_color")],
+                              key = "Plant_pathogens", 
+                              type = "DATASET_COLORSTRIP", 
+                              tree = tree)
+unit_plant_pathogens@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_plant_pathogens@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_plant_pathogens
+
+
+#制作Pathotroph色环
+unique_Pathotroph = rev(sort(unique(annotation$Pathotroph)))
+colorlist_Pathotroph = c("#eeeeee","#BF6074",add_alpha("#BF6074",0.4))
+Pathotroph_color_map = data.frame(Pathotroph = unique_Pathotroph,
+                                  Pathotroph_color = colorlist_Pathotroph)
+unit_Pathotroph <- create_unit(data = merge(annotation[ ,c("taxid","Pathotroph")],Pathotroph_color_map,by="Pathotroph")[ ,c("taxid","Pathotroph","Pathotroph_color")],
+                               key = "Pathotroph", 
+                               type = "DATASET_COLORSTRIP", 
+                               tree = tree)
+unit_Pathotroph@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Pathotroph@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Pathotroph
+
+#制作Saprotrophs色环
+
+unique_Saprotrophs = rev(sort(unique(annotation$Saprotrophs)))
+colorlist_Saprotrophs = c("#eeeeee","#F3BB34",add_alpha("#F3BB34",0.4))
+Saprotrophs_color_map = data.frame(Saprotrophs = unique_Saprotrophs,
+                                   Saprotrophs_color = colorlist_Saprotrophs)
+unit_Saprotrophs <- create_unit(data = merge(annotation[ ,c("taxid","Saprotrophs")],Saprotrophs_color_map,by="Saprotrophs")[ ,c("taxid","Saprotrophs","Saprotrophs_color")],
+                                key = "Saprotrophs", 
+                                type = "DATASET_COLORSTRIP", 
+                                tree = tree)
+unit_Saprotrophs@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Saprotrophs@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Saprotrophs
+
+
+#制作Saprotroph色环
+unique_Saprotroph = rev(sort(unique(annotation$Saprotroph)))
+colorlist_Saprotroph = c("#eeeeee","#E9A564",add_alpha("#E9A564",0.4))
+Saprotroph_color_map = data.frame(Saprotroph = unique_Saprotroph,
+                                  Saprotroph_color = colorlist_Saprotroph)
+unit_Saprotroph <- create_unit(data = merge(annotation[ ,c("taxid","Saprotroph")],Saprotroph_color_map,by="Saprotroph")[ ,c("taxid","Saprotroph","Saprotroph_color")],
+                               key = "Saprotroph", 
+                               type = "DATASET_COLORSTRIP", 
+                               tree = tree)
+unit_Saprotroph@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Saprotroph@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Saprotroph
+
+#制作流行度柱状图
+prevalence_s = annotation[ ,c("taxid","prevalence_s")]
+prevalence_s$prevalence_s[prevalence_s$prevalence_s=="Unknown"] = 0
+prevalence_s$prevalence_s = as.numeric(prevalence_s$prevalence_s)
+unit_prevalence_s <- create_unit(data = prevalence_s,
+                       key = "Prevalence",
+                       type = "DATASET_SIMPLEBAR",
+                       tree = tree)
+unit_prevalence_s@profile$color = "#1A6C92"
+unit_prevalence_s@specific_themes$basic_plot$width = 250
+unit_prevalence_s@specific_themes$basic_plot$dataset_scale = c(10,20,40,60,80)
+hub <- hub + unit_prevalence_s
+
+unit_lable <- create_unit(data = annotation[ ,c("taxid","Genus")],
+                          key = "LABELS",
+                          type = "LABELS",
+                          tree = tree)
+hub <- hub + unit_lable
+
+dir.create("result/GOS/tree_g_its/itol_annotation")
+write_hub(hub, "result/GOS/tree_g_its/itol_annotation")
+
+# 常见属的小柱状图
+library(ggplot2)
+library(dplyr)
+freq_pre_df = as.data.frame(table(annotation$Genus))
+freq_pre_df$pre = freq_pre_df$Freq/sum(freq_pre_df$Freq)*100
+freq_pre_df = freq_pre_df[freq_pre_df$Var1!="Unassigned",]
+colnames(freq_pre_df)[1] = "Genus"
+top10_df <- freq_pre_df %>%
+  arrange(desc(pre)) %>% 
+  slice_head(n = 10) %>% 
+  mutate(Genus = factor(Genus, levels = rev(unique(Genus))))
+
+ggplot(top10_df, aes(x = Genus, y = pre, fill = pre)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(round(pre, 2), "%")), 
+            hjust = -0.1, size = 4, color = "black") +
+  scale_fill_gradient(low = "#E0F2FF", high = "#1F4A7A") +
+  ggtitle("Top 10 Genus") +
+  coord_flip() +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    legend.position = "none",  
+    axis.title = element_blank(),  
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(), 
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  ) +
+  expand_limits(y = max(top10_df$pre) * 1.15)
+ggsave("result/GOS/tree_g_its/top10_genus.pdf",width = 3,height = 3)
+```
+
+# Preparation of fungal specialist tree annotation file
+```{r}
+rm(list = ls())
+source("Tools.R")
+library(itol.toolkit)
+library(dplyr)
+library(data.table)
+library(ape)
+library(stringr)
+library(tidyr)
+#开始构建树注释文件(通才树)
+annotation = read.delim("result/GOS/tree_s_its/annotation_s_its.txt")
+tree <- read.tree("raw/tree_s_its_itol.nwk")
+tree_label = tree$tip.label
+name_df = data.frame(index = c(1:length(tree_label)),
+                     taxid = tree_label)
+annotation = merge(name_df,annotation,by="taxid")
+
+annotation <- annotation %>%
+  group_by(Class) %>%
+  mutate(Class_count = n()) %>%
+  ungroup() %>%
+  arrange(desc(Class_count)) %>%
+  mutate(Class_rank = dense_rank(desc(Class_count))) %>%
+  mutate(Class_simp = ifelse(Class_rank > 17, "Other", Class)) %>%
+  select(-Class_count, -Class_rank)
+annotation = annotation %>% 
+  arrange(index)%>%
+  mutate(Saprotrophs = ifelse(general_saprotrophs == "TRUE"|specialized_saprotrophs == "TRUE","TRUE",
+                              ifelse(general_saprotrophs == "FALSE" & specialized_saprotrophs == "FALSE","FALSE","Unknown")))
+annotation$Class_simp[annotation$Class_simp=="Unassigned"]="Other"
+colorlist1 = c("#99C2C8","#DA7289","#9EB395","#EBD7A5","#C1D2E2",
+               "#099396","#016074","#E9BDA0","#9D2227","#EE9B01",
+               "#3E4069","#D98267","#517D7E","#CA820A","#808DAA",
+               "#E5A984","#552379","#B24057","#A49BC6","#F7E09B",
+               "#93CEDF","#D5ABBF","#846992","#A23F25","#73BEA0",
+               "#E4A644","#BC9F77","#CB3F48","#A94B32","#8A926B",
+               "#9B443B","#7B6D4A","#4B5B74","#C6803A","#CB4047")
+colorlist2 = c("#FCB366","#FE816F","#90D7C7","#93BCD0","#AF3F4F",
+               "#E5C28C","#CA8BB6","#1A6C92","#EAB46E","#8CC3BD",
+               "#8F9EC5","#6C77B5","#138A8E","#4B9D77","#8E60A8",
+               "#DC6D73","#B2B896","#E97DAE","#FB7A64","#EDCE35",
+               "#99C2C8","#DA7289","#B24057","#EBD7A5","#92D2C1",
+               "#4E56AB","#0FBFBC","#E9A564","#ADD565","#ADADAD",
+               "#F3BB34","#F8AD9A","#5163B5","#613767","#56B394")
+
+hub <- create_hub(tree = tree)
+
+#制作Phylum色环
+#配置颜色
+unique_Phylum = unique(annotation$Phylum)
+unique_Phylum = c(unique_Phylum[unique_Phylum!="Unassigned"],"Unassigned")
+colorlist_Phylum = colorlist1[1:length(unique_Phylum)]
+Phylum_color_map = data.frame(Phylum = unique_Phylum,
+                             Phylum_color = colorlist_Phylum)
+Phylum_color_map$Phylum_color[Phylum_color_map$Phylum=="Unassigned"] = "#eeeeee"
+create_color_legend(Phylum_color_map, save_path = "result/GOS/tree_s_its/Phylum_legend.pdf", shape = "square", 
+                                layout = "row", n = 2, title = "Phylum", 
+                                label_size = 4, title_size = 6, ifsave = TRUE)
+freq_phylum = as.data.frame(table(annotation$Phylum))
+freq_phylum$pre = freq_phylum$Freq/sum(freq_phylum$Freq)
+unit_Phylum <- create_unit(data = merge(annotation[ ,c("taxid","Phylum")],Phylum_color_map,by="Phylum")[ ,c("taxid","Phylum","Phylum_color")],
+                          key = "Phylum",
+                          type = "DATASET_COLORSTRIP",
+                          tree = tree)
+unit_Phylum@common_themes$legend$horizontal = NULL #调整图例为竖向
+# unit_Phylum@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Phylum
+
+
+#制作Class_simp色环
+#配置颜色
+unique_Class_simp = unique(annotation$Class_simp)
+unique_Class_simp = c(unique_Class_simp[unique_Class_simp!="Other"],"Other")
+colorlist_Class_simp = colorlist2[1:length(unique_Class_simp)]
+Class_simp_color_map = data.frame(Class_simp = unique_Class_simp,
+                             Class_simp_color = colorlist_Class_simp)
+Class_simp_color_map$Class_simp_color[Class_simp_color_map$Class_simp=="Other"] = "#eeeeee"
+create_color_legend(Class_simp_color_map, save_path = "result/GOS/tree_s_its/Class_simp_legend.pdf", shape = "square", 
+                                layout = "row", n = 3, title = "Class_simp", 
+                                label_size = 4, title_size = 6, ifsave = TRUE)
+unit_Class_simp <- create_unit(data = merge(annotation[ ,c("taxid","Class_simp")],Class_simp_color_map,by="Class_simp")[ ,c("taxid","Class_simp","Class_simp_color")],
+                          key = "Class",
+                          type = "DATASET_COLORSTRIP",
+                          tree = tree)
+unit_Class_simp@common_themes$legend$horizontal = NULL #调整图例为竖向
+# unit_Class_simp@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Class_simp
+#给颜色加alpha
+add_alpha <- function(color, alpha) {
+  # 将16进制颜色转为RGB
+  rgb_col <- col2rgb(color)
+  
+  # 返回带alpha的颜色
+  return(rgb(rgb_col[1,], rgb_col[2,], rgb_col[3,], 
+             alpha = alpha * 255, maxColorValue = 255))
+}
+
+#制作mycorrhizal色环
+unique_mycorrhizal = rev(sort(unique(annotation$mycorrhizal)))
+colorlist_mycorrhizal = c("#eeeeee","#016074",add_alpha("#016074",0.6))
+mycorrhizal_color_map = data.frame(mycorrhizal = unique_mycorrhizal,
+                                 mycorrhizal_color = colorlist_mycorrhizal)
+unit_mycorrhizal <- create_unit(data = merge(annotation[ ,c("taxid","mycorrhizal")],mycorrhizal_color_map,by="mycorrhizal")[ ,c("taxid","mycorrhizal","mycorrhizal_color")],
+                              key = "Mycorrhizal", 
+                              type = "DATASET_COLORSTRIP", 
+                              tree = tree)
+unit_mycorrhizal@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_mycorrhizal@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_mycorrhizal
+
+#制作plant_associates色环
+unique_plant_associates = rev(sort(unique(annotation$plant_associates)))
+colorlist_plant_associates = c("#eeeeee","#3E4069",add_alpha("#3E4069",0.4))
+plant_associates_color_map = data.frame(plant_associates = unique_plant_associates,
+                                   plant_associates_color = colorlist_plant_associates)
+unit_plant_associates <- create_unit(data = merge(annotation[ ,c("taxid","plant_associates")],plant_associates_color_map,by="plant_associates")[ ,c("taxid","plant_associates","plant_associates_color")],
+                                key = "Plant_associates", 
+                                type = "DATASET_COLORSTRIP", 
+                                tree = tree)
+unit_plant_associates@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_plant_associates@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_plant_associates
+
+#制作Symbiotroph色环
+unique_Symbiotroph = rev(sort(unique(annotation$Symbiotroph)))
+colorlist_Symbiotroph = c("#eeeeee","#099396",add_alpha("#099396",0.4))
+Symbiotroph_color_map = data.frame(Symbiotroph = unique_Symbiotroph,
+                                   Symbiotroph_color = colorlist_Symbiotroph)
+unit_Symbiotroph <- create_unit(data = merge(annotation[ ,c("taxid","Symbiotroph")],Symbiotroph_color_map,by="Symbiotroph")[ ,c("taxid","Symbiotroph","Symbiotroph_color")],
+                                key = "Symbiotroph", 
+                                type = "DATASET_COLORSTRIP", 
+                                tree = tree)
+unit_Symbiotroph@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Symbiotroph@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Symbiotroph
+
+#制作plant_pathogens色环
+unique_plant_pathogens = rev(sort(unique(annotation$plant_pathogens)))
+colorlist_plant_pathogens = c("#eeeeee","#9D2227",add_alpha("#9D2227",0.4))
+plant_pathogens_color_map = data.frame(plant_pathogens = unique_plant_pathogens,
+                                 plant_pathogens_color = colorlist_plant_pathogens)
+unit_plant_pathogens <- create_unit(data = merge(annotation[ ,c("taxid","plant_pathogens")],plant_pathogens_color_map,by="plant_pathogens")[ ,c("taxid","plant_pathogens","plant_pathogens_color")],
+                              key = "Plant_pathogens", 
+                              type = "DATASET_COLORSTRIP", 
+                              tree = tree)
+unit_plant_pathogens@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_plant_pathogens@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_plant_pathogens
+
+
+#制作Pathotroph色环
+unique_Pathotroph = rev(sort(unique(annotation$Pathotroph)))
+colorlist_Pathotroph = c("#eeeeee","#BF6074",add_alpha("#BF6074",0.4))
+Pathotroph_color_map = data.frame(Pathotroph = unique_Pathotroph,
+                                  Pathotroph_color = colorlist_Pathotroph)
+unit_Pathotroph <- create_unit(data = merge(annotation[ ,c("taxid","Pathotroph")],Pathotroph_color_map,by="Pathotroph")[ ,c("taxid","Pathotroph","Pathotroph_color")],
+                               key = "Pathotroph", 
+                               type = "DATASET_COLORSTRIP", 
+                               tree = tree)
+unit_Pathotroph@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Pathotroph@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Pathotroph
+
+#制作Saprotrophs色环
+
+unique_Saprotrophs = rev(sort(unique(annotation$Saprotrophs)))
+colorlist_Saprotrophs = c("#eeeeee","#F3BB34",add_alpha("#F3BB34",0.4))
+Saprotrophs_color_map = data.frame(Saprotrophs = unique_Saprotrophs,
+                                   Saprotrophs_color = colorlist_Saprotrophs)
+unit_Saprotrophs <- create_unit(data = merge(annotation[ ,c("taxid","Saprotrophs")],Saprotrophs_color_map,by="Saprotrophs")[ ,c("taxid","Saprotrophs","Saprotrophs_color")],
+                                key = "Saprotrophs", 
+                                type = "DATASET_COLORSTRIP", 
+                                tree = tree)
+unit_Saprotrophs@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Saprotrophs@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Saprotrophs
+
+
+#制作Saprotroph色环
+unique_Saprotroph = rev(sort(unique(annotation$Saprotroph)))
+colorlist_Saprotroph = c("#eeeeee","#E9A564",add_alpha("#E9A564",0.4))
+Saprotroph_color_map = data.frame(Saprotroph = unique_Saprotroph,
+                                  Saprotroph_color = colorlist_Saprotroph)
+unit_Saprotroph <- create_unit(data = merge(annotation[ ,c("taxid","Saprotroph")],Saprotroph_color_map,by="Saprotroph")[ ,c("taxid","Saprotroph","Saprotroph_color")],
+                               key = "Saprotroph", 
+                               type = "DATASET_COLORSTRIP", 
+                               tree = tree)
+unit_Saprotroph@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Saprotroph@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Saprotroph
+
+dir.create("result/GOS/tree_s_its/itol_annotation")
+write_hub(hub, "result/GOS/tree_s_its/itol_annotation")
+```
+
+
+
+# Draw a pcoa diagram based on jaccard distance
+```{r,fig.show='animate'}
+rm(list = ls())
+dir.create("result/host_microbiome")
+# Load required packages
+library(vegan)
+library(parallelDist)
+library(data.table)
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+library(tibble)
+# Import data
+sample_taxid_01_16s = fread("standard/sample_taxid_01_16s.txt")
+sample_taxid_01_16s = as.data.frame(column_to_rownames(sample_taxid_01_16s,"taxid"))
+sample_taxid_01_16s = sample_taxid_01_16s[rownames(sample_taxid_01_16s)!="Unassigned",]
+
+sample_taxid_01_its = fread("standard/sample_taxid_01_its.txt")
+sample_taxid_01_its = as.data.frame(column_to_rownames(sample_taxid_01_its,"taxid"))
+sample_taxid_01_its = sample_taxid_01_its[rownames(sample_taxid_01_its)!="Unassigned",]
+
+metadata_16s <- read.delim("raw/metadata_16s.txt")
+metadata_its <- read.delim("raw/metadata_its.txt")
+
+# 16S PCoA and PERMANOVA
+jaccard_dist_16s <- parDist(t(sample_taxid_01_16s),
+                        method = "binary",
+                        threads = 8)
+saveRDS(jaccard_dist_16s, "result/host_microbiome/jaccard_dist_16s.rds")
+jaccard_dist_16s <- readRDS("result/host_microbiome/jaccard_dist_16s.rds")
+
+design_16s <- column_to_rownames(metadata_16s, "SampleID")
+
+adonis_16s2 = adonis2(jaccard_dist_16s ~ Species + extract_way + country, 
+                     data = design_16s, permutations = 999,
+                     method="jaccard", by="margin",parallel = 8)
+saveRDS(adonis_16s2, "result/host_microbiome/adonis_16s2.rds")
+adonis_16s2 <- readRDS("result/host_microbiome/adonis_16s2.rds")
+
+pcoa_16s <- cmdscale(jaccard_dist_16s, k = 2, eig = TRUE)
+pcoa_scores <- as.data.frame(pcoa_16s$points)
+colnames(pcoa_scores) <- c("PCoA1", "PCoA2")
+pcoa_scores$SampleID <- rownames(pcoa_scores)
+pcoa_data_16s <- merge(pcoa_scores, metadata_16s, by = "SampleID", all.x = TRUE)
+
+# Calculate variance explained by the first two axes
+eigenvalues <- pcoa_16s$eig
+variance_explained <- eigenvalues / sum(eigenvalues) * 100
+pc1_var_16s <- round(variance_explained[1], 2)
+pc2_var_16s <- round(variance_explained[2], 2)
+
+# ITS PCoA and PERMANOVA
+jaccard_dist_its <- parDist(t(sample_taxid_01_its),
+                        method = "binary",
+                        threads = 8)
+saveRDS(jaccard_dist_its, "result/host_microbiome/jaccard_dist_its.rds")
+jaccard_dist_its <- readRDS("result/host_microbiome/jaccard_dist_its.rds")
+
+spe_its = t(sample_taxid_01_its)
+design_its <- column_to_rownames(metadata_its, "SampleID")
+
+
+adonis_its2 = adonis2(jaccard_dist_its ~ Species + extract_way + country,
+                     data =design_its,permutations = 999,
+                     method="jaccard", by="margin",parallel = 8)
+saveRDS(adonis_its2, "result/host_microbiome/adonis_its2.rds")
+adonis_its2 <- readRDS("result/host_microbiome/adonis_its2.rds")
+
+pcoa_its <- cmdscale(jaccard_dist_its, k = 2, eig = TRUE)
+pcoa_scores <- as.data.frame(pcoa_its$points)
+colnames(pcoa_scores) <- c("PCoA1", "PCoA2")
+pcoa_scores$SampleID <- rownames(pcoa_scores)
+pcoa_data_its <- merge(pcoa_scores, metadata_its, by = "SampleID", all.x = TRUE)
+
+# Calculate variance explained by the first two axes
+eigenvalues <- pcoa_its$eig
+variance_explained <- eigenvalues / sum(eigenvalues) * 100
+pc1_var_its <- round(variance_explained[1], 2)
+pc2_var_its <- round(variance_explained[2], 2)
+
+# Create a unified color palette for plant genera
+
+colorlist <- c(
+  "#855B67" ,"#B6BCCA" ,"#C1B5BF" ,"#FDE0E4" ,
+  "#78A495" ,"#8A926B" ,"#5D6C57" ,"#6E736D" ,"#E4E2C9",
+  "#CFE1D3" ,"#995B70" ,"#846992" ,"#D4C0C2" ,"#F7E09B",
+  "#099396" ,"#E7D6C2" ,"#547FB6" ,"#C5D8E7" ,"#BF6173",
+  "#3A5A40", "#90DBF4", "#641E16", "#BFEFEE", "#D35400", 
+  "#1D3557", "#F1C40F", "#5B2C6F", "#A7C957", "#E63946", 
+  "#355070", "#F4A261", "#1E5959", "#CB997E", 
+  "#2A9D8F", "#FFE8D6", "#6D597A", "#F9C74F", "#2E4053", 
+  "#A8DADC", "#BA4A00", "#7DCEA0", "#424949", "#E5989B",
+  "#E07A5F", "#F2CC8F", "#81B29A", "#3D405B", "#F4A261",
+  "#E76F51", "#2A9D8F", "#264653", "#F9C74F", "#A8DADC",
+  "#E63946", "#F1FAEE", "#457B9D", "#E0A458", "#6D597A",
+  "#B5E8D5", "#FFBF69", "#2EC4B6", "#1D3557", "#F6BD60",
+  "#8AC6C3", "#E56B6F", "#4A6FA5", "#F5E8C7", "#233D4D"
+)
+annotation = read.delim("planttree/all_tree/all_plant_annotation.txt")
+unique_Order = unique(annotation$Order)
+plant_Order_color = colorlist[1:length(unique_Order)]
+names(plant_Order_color) = unique_Order
+
+# Plot 16S PCoA
+p1 <- ggplot(pcoa_data_16s, aes(x = PCoA1, y = PCoA2, color = Order)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(x = paste0("PCoA1 (", pc1_var_16s, "%)"),
+       y = paste0("PCoA2 (", pc2_var_16s, "%)"),
+       color = "Plant Order",
+       title = "16S Samples",
+       subtitle = paste("Plant species R²=", round((adonis_16s2$R2[1]), 3), "p<", adonis_16s2$`Pr(>F)`[1])) +
+  scale_color_manual(values = plant_Order_color) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5,
+      margin = margin(b = 10)
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5,
+      lineheight = 1.2,
+      margin = margin(b = 15)
+    ),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14, color = "black", face = "bold"),
+    legend.text = element_text(size = 14, color = "black"),
+    plot.margin = margin(t = 10,
+                         r = 30,
+                         b = 10,
+                         l = 10,
+                         unit = "pt")
+  )
+
+# Plot ITS PCoA
+p2 <- ggplot(pcoa_data_its, aes(x = PCoA1, y = PCoA2, color = Order)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(x = paste0("PCoA1 (", pc1_var_its, "%)"),
+       y = paste0("PCoA2 (", pc2_var_its, "%)"),
+       color = "Plant Order",
+       title = "ITS Samples",
+       subtitle = paste("Plant species R²=", round((adonis_its2$R2[1]), 3), "p<", adonis_its2$`Pr(>F)`[1])) +
+  scale_color_manual(values = plant_Order_color) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+    plot.title = element_text(
+      size = 20,
+      face = "bold",
+      color = "black",
+      hjust = 0.5,
+      margin = margin(b = 10)
+    ),
+    plot.subtitle = element_text(
+      size = 12,
+      color = "black",
+      hjust = 0.5,
+      lineheight = 1.2,
+      margin = margin(b = 15)
+    ),
+    axis.text.x = element_text(size = 14, color = "black"),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black", angle = 0),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14, color = "black", face = "bold"),
+    legend.text = element_text(size = 14, color = "black"),
+    plot.margin = margin(t = 10,
+                         r = 30,
+                         b = 10,
+                         l = 10,
+                         unit = "pt")
+  )
+
+# Combine plots with a shared legend
+combined_plot <- ggarrange(p1, p2,
+                           ncol = 2,
+                           common.legend = TRUE,
+                           legend = "right")
+
+combined_plot
+ggsave("result/host_microbiome/16s_its_PCoA__jaccard2.pdf", plot = combined_plot, width = 13.6, height = 5.5)
+
+```
+
+# Use PERMANOVA and VPA analyses to test the contribution of host factors to the community results
+```{r,fig.show='animate'}
+rm(list = ls())
+library(ggplot2)
+library(dplyr)
+library(vegan)
+library(tidyr)
+
+design_16s <- read.delim("raw/metadata_16s.txt",row.names = 1)
+design_its <- read.delim("raw/metadata_its.txt",row.names = 1)
+# vpa
+jaccard_dist_16s <- readRDS("result/host_microbiome/jaccard_dist_16s.rds")
+jaccard_dist_its <- readRDS("result/host_microbiome/jaccard_dist_its.rds")
+
+vpa_result_16s <- varpart(jaccard_dist_16s, 
+                      ~ Species, 
+                      ~ extract_way, 
+                      ~ country, 
+                      data = design_16s)
+pdf("result/host_microbiome/vpa_plot_16s.pdf", width = 7, height = 6) 
+plot(vpa_result_16s, 
+     digits = 2, 
+     Xnames = c("Species", "Extract_way", "Country"), 
+     bg = c("#355070", "#264653", "#81B29A"))
+dev.off()
+
+
+vpa_result_its <- varpart(jaccard_dist_its, 
+                          ~ Species, 
+                          ~ extract_way, 
+                          ~ country, 
+                          data = design_its)
+pdf("result/host_microbiome/vpa_plot_its.pdf", width = 7, height = 6)
+plot(vpa_result_its, 
+     digits = 2, 
+     Xnames = c("Species", "Extract_way", "Country"), 
+     bg = c("#355070", "#264653", "#81B29A"))
+dev.off()
+
+# PERMANOVA
+
+prepare_data <- function(df, label) {
+  df %>%
+    as.data.frame() %>%
+    mutate(Factor = rownames(.)) %>%
+    filter(Factor %in% c("Species", "country", "extract_way")) %>%
+    mutate(Community = label) %>%
+    select(Community, Factor, R2)
+}
+
+
+adonis_16s <- readRDS("result/host_microbiome/adonis_16s2.rds")
+adonis_its <- readRDS("result/host_microbiome/adonis_its2.rds")
+
+plot_df_16s <- prepare_data(adonis_16s, "16S (Bacteria)")
+plot_df_its <- prepare_data(adonis_its, "ITS (Fungi)")
+
+final_plot_df <- rbind(plot_df_16s, plot_df_its)
+final_plot_df$R2_percent <- final_plot_df$R2 * 100
+
+PERMANOVA = ggplot(final_plot_df, aes(x = Factor, y = R2_percent, fill = Community)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = sprintf("%.2f%%", R2_percent)), 
+            position = position_dodge(width = 0.8), 
+            vjust = -0.5, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c("16S (Bacteria)" = "#4E79A7", "ITS (Fungi)" = "#81B29A")) +
+  labs(title = "Comparison of Community Variation Explained (R²)",
+       x = "Explanatory Factors",
+       y = "Variance Explained (R² %)",
+       fill = "Community Type") +
+  scale_y_continuous(limits = c(0, max(final_plot_df$R2_percent) + 2)) +
+  theme_bw() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey30"),
+    axis.text = element_text(size = 11, color = "black"),
+    legend.position = "top"
+  )
+ggsave("result/host_microbiome/PERMANOVA.pdf",plot = PERMANOVA, width = 5, height = 5)
+PERMANOVA
+```
+
+# The relationship between the genetic development distance of the host and the Jaccard distance of the seed community
+```{r}
+rm(list = ls())
+library(ape)
+library(vegan)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+
+#计算平均距离的函数
+mean_dist = function(indata,calssify_df){
+  colnames(calssify_df) = c("SampleID","groups")
+  common_list = intersect(rownames(indata),calssify_df$SampleID)
+  calssify_df = calssify_df[calssify_df$SampleID%in%common_list,]
+  indata = indata[common_list,common_list]
+  group_list = unique(calssify_df$groups)
+  group_list_num = length(group_list)
+  group_matrix = matrix(data = 1,ncol = group_list_num,nrow = group_list_num)
+  colnames(group_matrix) = group_list
+  rownames(group_matrix) = group_list
+  for (i in 1:group_list_num){
+    row_group = group_list[i]
+    row_id = calssify_df$SampleID[calssify_df$groups==row_group]
+    for (j in 1:group_list_num){
+      col_group = group_list[j]
+      col_id = calssify_df$SampleID[calssify_df$groups==col_group]
+      temp_dist_matrix = indata[row_id,col_id]
+      mean_dist = mean(temp_dist_matrix)
+      group_matrix[i,j]=mean_dist
+    }
+  }
+  return(group_matrix)
+}
+
+tree_16s <- read.tree("planttree/plant_species_tree_16s.nwk")
+tree_matrix_16s <- cophenetic(tree_16s)
+#计算微生物距离
+metadata_16s = read.delim("raw/metadata_16s.txt")
+jaccard_dist_16s <- readRDS("result/host_microbiome/jaccard_dist_16s.rds")
+jaccard_matrix_16s = as.matrix(jaccard_dist_16s)
+species_matrix_16s = mean_dist(jaccard_matrix_16s,metadata_16s[ ,c("SampleID","Species")])
+species_matrix_16s = species_matrix_16s[rownames(tree_matrix_16s),rownames(tree_matrix_16s)]
+
+tree_its <- read.tree("planttree/plant_species_tree_its.nwk")
+tree_matrix_its <- cophenetic(tree_its)
+metadata_its = read.delim("raw/metadata_its.txt")
+jaccard_dist_its <- readRDS("result/host_microbiome/jaccard_dist_its.rds")
+jaccard_matrix_its = as.matrix(jaccard_dist_its)
+species_matrix_its = mean_dist(jaccard_matrix_its,metadata_its[ ,c("SampleID","Species")])
+species_matrix_its = species_matrix_its[rownames(tree_matrix_its),rownames(tree_matrix_its)]
+# Mantel
+mantel_result_16s <- mantel(tree_matrix_16s, species_matrix_16s, method = "pearson", permutations = 999)
+mantel_16s_r = mantel_result_16s$statistic
+mantel_16s_p = mantel_result_16s$signif
+mantel_result_its <- mantel(tree_matrix_its, species_matrix_its, method = "pearson", permutations = 999)
+mantel_its_r = mantel_result_its$statistic
+mantel_its_p = mantel_result_its$signif
+# MRM
+mrm_16s <- ecodist::MRM(as.dist(species_matrix_16s) ~ as.dist(tree_matrix_16s), nperm = 999)
+mrm_16s_r2 = mrm_16s$r.squared[1]
+mrm_16s_r2p = mrm_16s$r.squared[2]
+mrm_16s_F = mrm_16s$F.test[1]
+mrm_16s_Fp = mrm_16s$F.test[2]
+mrm_its <- ecodist::MRM(as.dist(species_matrix_its) ~ as.dist(tree_matrix_its), nperm = 999)
+mrm_its_r2 = mrm_its$r.squared[1]
+mrm_its_r2p = mrm_its$r.squared[2]
+mrm_its_F = mrm_its$F.test[1]
+mrm_its_Fp = mrm_its$F.test[2]
+
+# dbRDA
+pcoa_tree_16s <- cmdscale(tree_matrix_16s, k = 5, eig = TRUE)
+tree_vectors_16s <- as.data.frame(pcoa_tree_16s$points)
+dbrda_16s <- capscale(species_matrix_16s ~ ., data = tree_vectors_16s)
+dbRDA_16s_all = anova(dbrda_16s, permutations = 999)
+dbRDA_16s_terms = anova(dbrda_16s, by = "terms", permutations = 999)
+
+pcoa_tree_its <- cmdscale(tree_matrix_its, k = 5, eig = TRUE)
+tree_vectors_its <- as.data.frame(pcoa_tree_its$points)
+dbrda_its <- capscale(species_matrix_its ~ ., data = tree_vectors_its)
+dbRDA_its_all = anova(dbrda_its, permutations = 999)
+dbRDA_its_terms = anova(dbrda_its, by = "terms", permutations = 999)
+
+#结果可视化
+col_16s <- "#4E79A7"
+col_its <- "#81B29A"
+
+
+# Mantel+MRM
+get_df <- function(tree_mat, species_mat){
+  idx <- upper.tri(tree_mat)
+  data.frame(
+    phylo = tree_mat[idx],
+    micro = species_mat[idx]
+  )
+}
+
+df_16s <- get_df(tree_matrix_16s, species_matrix_16s)
+df_its <- get_df(tree_matrix_its, species_matrix_its)
+
+format_p <- function(p){
+  if(p < 0.01) return("<0.01")
+  sprintf("%.3f", p)
+}
+
+label_16s <- paste0(
+  "Mantel r = ", round(mantel_16s_r, 3), "\n",
+  "p ", format_p(mantel_16s_p), "\n\n",
+  "MRM R² = ", round(mrm_16s_r2, 3), "\n",
+  "p ", format_p(mrm_16s_r2p)
+)
+
+label_its <- paste0(
+  "Mantel r = ", round(mantel_its_r, 3), "\n",
+  "p ", format_p(mantel_its_p), "\n\n",
+  "MRM R² = ", round(mrm_its_r2, 3), "\n",
+  "p ", format_p(mrm_its_r2p)
+)
+
+make_plot <- function(df, color, title, label){
+
+  ggplot(df, aes(x = phylo, y = micro)) +
+    geom_point(color = color, alpha = 0.2, size = 1.2) +
+    
+    # 回归线
+    geom_smooth(method = "lm", color = color, se = FALSE, linewidth = 1.2) +
+    
+    # 主题
+    theme_bw(base_size = 13) +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold", size = 14),
+      axis.title = element_text(size = 12)
+    ) +
+    
+    labs(
+      title = title,
+      x = "Host phylogenetic distance",
+      y = "Microbial community dissimilarity (Jaccard)"
+    ) +
+    
+    # 添加统计信息
+    annotate(
+      "text",
+      x = Inf, y = -Inf,
+      label = label,
+      hjust = 1.05, vjust = -0.2,
+      size = 4
+    )
+}
+
+
+p1 <- make_plot(
+  df_16s,
+  col_16s,
+  "16S (Bacterial community)",
+  label_16s
+)
+
+p2 <- make_plot(
+  df_its,
+  col_its,
+  "ITS (Fungal community)",
+  label_its
+)
+
+
+final_plot_mantel_mrm <- p1 + p2 + plot_layout(ncol = 2)
+final_plot_mantel_mrm
+
+
+# MRM可视化
+get_r2 <- function(dbrda_obj){
+  eig <- dbrda_obj$CCA$eig
+  tot <- dbrda_obj$tot.chi
+  sum(eig) / tot
+}
+
+
+get_p <- function(anova_res){
+  anova_res$`Pr(>F)`[1]
+}
+
+label_16s <- paste0(
+  "dbRDA R² = ", round(get_r2(dbrda_16s), 3), "\n",
+  "p ", ifelse(get_p(dbRDA_16s_all) < 0.01, "<0.01", round(get_p(dbRDA_16s_all), 3))
+)
+
+label_its <- paste0(
+  "dbRDA R² = ", round(get_r2(dbrda_its), 3), "\n",
+  "p ", ifelse(get_p(dbRDA_its_all) < 0.01, "<0.01", round(get_p(dbRDA_its_all), 3))
+)
+
+
+scores_16s <- as.data.frame(scores(dbrda_16s, display = "sites"))
+scores_its <- as.data.frame(scores(dbrda_its, display = "sites"))
+
+make_dbrda_plot <- function(df, color, title, label){
+
+  ggplot(df, aes(x = CAP1, y = CAP2)) +
+    
+    # 点
+    geom_point(color = color, alpha = 0.7, size = 2) +
+    
+    # 零轴线（更专业）
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+    
+    # 主题
+    theme_bw(base_size = 13) +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold", size = 14),
+      axis.title = element_text(size = 12)
+    ) +
+    
+    labs(
+      title = title,
+      x = "CAP1",
+      y = "CAP2"
+    ) +
+    
+    # 标注统计结果
+    annotate(
+      "text",
+      x = Inf, y = Inf,
+      label = label,
+      hjust = 1.1, vjust = 1.5,
+      size = 4
+    )
+}
+
+p3 <- make_dbrda_plot(
+  scores_16s,
+  col_16s,
+  "dbRDA (16S bacterial community)",
+  label_16s
+)
+
+p4 <- make_dbrda_plot(
+  scores_its,
+  col_its,
+  "dbRDA (ITS fungal community)",
+  label_its
+)
+
+
+final_plot_dbrda <- p3 + p4 + plot_layout(ncol = 2)
+final_plot_dbrda
+
+ggsave("result/host_microbiome/Mantel_MRM.pdf",final_plot_mantel_mrm,height = 4,width = 8)
+ggsave("result/host_microbiome/dbRDA.pdf",final_plot_dbrda,height = 6,width = 12)
+```
+
+
+#Trait shifts with prevalence
+#16S samples
+```{r}
+rm(list = ls())
+source("Tools.R")
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(reshape2)
+library(forcats)
+dir.create("result/Trait_shifts")
+taxonomy_16s_extended = read.delim("standard/taxonomy_16s_extended.txt")
+#The relationship between the taxonomic-level species composition and prevalence_s of the 16s sample
+prevalence_s_Class_16s = taxonomy_16s_extended[ ,c("prevalence_s","Class")]
+prevalence_s_Class_16s[prevalence_s_Class_16s$prevalence_s >= 25,]$prevalence_s = 25
+
+make_mutibar(datain = prevalence_s_Class_16s,
+             out_dir = "result/Trait_shifts/Class_levels_change_16s.pdf",
+             x_name = "Prevalence_s",
+             y_name = "Proportion of Taxid",
+             legend_name = "Class",
+             limit_num = 6,
+             width = 11.2,
+             height = 5,
+             other_list = c("Unassigned","Incertae Sedis"),
+             colorlist = c("#FCB366", "#FE816F", "#90D7C7","#93BCD0", "#AF3F4F", 
+                           "#F3BB34", "#F8AD9A", "#5163B5", "#613767", "#56B394",
+                           "#DC6D73", "#B2B896", "#E97DAE","#FB7A64","#EDCE35", 
+                           "#E5C28C", "#CA8BB6", "#1A6C92", "#EAB46E", "#8CC3BD", 
+                           "#4E56AB","#0FBFBC", "#E9A564", "#ADD565", "#ADADAD", 
+                           "#8F9EC5", "#6C77B5", "#138A8E", "#4B9D77", "#8E60A8")
+             )
+Class_test = Calculate_correlation(prevalence_s_Class_16s,"prevalence_s","Class")
+class_prop = as.data.frame(table(prevalence_s_Class_16s$Class))
+main_class = class_prop$Var1[class_prop$Freq>500]
+Class_test = Class_test[Class_test$Variable%in%main_class,]
+print(Class_test)
+#----------------------------------------------------------------------
+
+#The relationship between the aerobic/anaerobic conditions of the 16s samples and the prevalence_s rate
+prevalence_s_Aerobic_type_16s = taxonomy_16s_extended[ ,c("prevalence_s","Aerobic_type")]
+prevalence_s_Aerobic_type_16s <- prevalence_s_Aerobic_type_16s %>%
+  replace(is.na(.), "Unknown")
+prevalence_s_Aerobic_type_16s[prevalence_s_Aerobic_type_16s$prevalence_s >= 25,]$prevalence_s = 25
+make_mutibar(datain = prevalence_s_Aerobic_type_16s,
+             out_dir = "result/Trait_shifts/prevalence_s_Aerobic_type_change_16s.pdf",
+             x_name = "Prevalence_s",
+             y_name = "Proportion of Taxid",
+             legend_name = "Aerobic_type",
+             limit_num = 10,
+             width = 11.2,
+             height = 5,
+             other_list = c("Unassigned","Incertae Sedis","Unknown"),
+             colorlist = c("#99C2C8","#D4693F","#E4A644","#eeeeee")
+)
+Aerobic_type_test = Calculate_correlation(prevalence_s_Aerobic_type_16s,"prevalence_s","Aerobic_type")
+print(Aerobic_type_test)
+#--------------------------------------------------------------------------
+
+
+#The relationship between the biofilm-forming potential of 16s samples and their prevalence_s rate
+prevalence_s_Forms_Biofilms_16s = taxonomy_16s_extended[ ,c("prevalence_s","Forms_Biofilms")]
+prevalence_s_Forms_Biofilms_16s <- prevalence_s_Forms_Biofilms_16s %>%
+  replace(is.na(.), "Unknown")
+prevalence_s_Forms_Biofilms_16s[prevalence_s_Forms_Biofilms_16s$prevalence_s >= 25,]$prevalence_s = 25
+make_mutibar(datain = prevalence_s_Forms_Biofilms_16s,
+             out_dir = "result/Trait_shifts/prevalence_s_Forms_Biofilms_change_16s.pdf",
+             x_name = "Prevalence_s",
+             y_name = "Proportion of Taxid",
+             legend_name = "Forms_Biofilms",
+             limit_num = 10,
+             width = 10,
+             height = 5,
+             other_list = c("Unassigned","Incertae Sedis","Unknown"),
+             colorlist = c("#846992","#E8C2D9","#eeeeee")
+)
+Forms_Biofilms_test = Calculate_correlation(prevalence_s_Forms_Biofilms_16s,"prevalence_s","Forms_Biofilms")
+print(Forms_Biofilms_test)
+#--------------------------------------------------------------------------------
+
+
+
+#The relationship between the Gram-positive and Gram-negative properties of the 16s samples and their prevalence_s rates
+prevalence_s_Gram_type_16s = taxonomy_16s_extended[ ,c("prevalence_s","Gram_type")]
+prevalence_s_Gram_type_16s <- prevalence_s_Gram_type_16s %>%
+  replace(is.na(.), "Unknown")
+prevalence_s_Gram_type_16s[prevalence_s_Gram_type_16s$prevalence_s >= 25,]$prevalence_s = 25
+make_mutibar(datain = prevalence_s_Gram_type_16s,
+             out_dir = "result/Trait_shifts/prevalence_s_Gram_type_change_16s.pdf",
+             x_name = "Prevalence_s",
+             y_name = "Proportion of Taxid",
+             legend_name = "Gram_type",
+             limit_num = 10,
+             width = 10,
+             height = 5,
+             other_list = c("Unassigned","Incertae Sedis","Unknown"),
+             colorlist = c("#4B5B74","#A1B1CB","#eeeeee")
+)
+Gram_type_test = Calculate_correlation(prevalence_s_Gram_type_16s,"prevalence_s","Gram_type")
+print(Gram_type_test)
+```
+
+## As popularity increases, the changes in genetic diversity occur.
+```{r,fig.show='animate'}
+rm(list = ls())
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+cds_data = read.delim("raw/cds_data.txt")
+cds_data$Genome_size = (cds_data$Genome_size)/1000000
+
+
+taxonomy_16s_extended <- read.delim("standard/taxonomy_16s_extended.txt")
+taxonomy_16s_extended = merge(taxonomy_16s_extended,cds_data,by = "taxid",all.x = TRUE)
+value_prevalence_maxmin = function(indata, Target_name, max_prevalence, out_dir) {
+  out_dir = paste0("result/Trait_shifts/", colnames(indata)[1], "_", colnames(indata)[2], ".pdf")
+  indata <- na.omit(indata)
+  colnames(indata) = c("prevalence", "Target_value")
+  indata$prevalence[indata$prevalence >= max_prevalence] = max_prevalence
+  indata = indata[indata$Target_value != "Unknown", ]
+  indata = indata[indata$Target_value != -1, ]
+  indata$Target_value = as.numeric(indata$Target_value)
+  
+  # 数据聚合
+  df_summary <- indata %>%
+    group_by(prevalence) %>%
+    summarise(Target_value_max = max(Target_value, na.rm = TRUE),
+              Target_value_min = min(Target_value, na.rm = TRUE))
+  
+  # 对min进行拟合
+  lm_model_min <- lm(Target_value_min ~ prevalence, data = df_summary)
+  a2 <- coef(lm_model_min)[1] # 截距
+  b2 <- coef(lm_model_min)[2] # 斜率
+  lable_min <- paste0("Min: y = ", round(a2, 2), " + ", round(b2, 2), "x\n", "R² = ", round(summary(lm_model_min)$r.squared, 3))
+  
+  # 对max进行拟合
+  lm_model_max <- lm(Target_value_max ~ prevalence, data = df_summary)
+  a1 <- coef(lm_model_max)[1] # 截距
+  b1 <- coef(lm_model_max)[2] # 斜率
+  lable_max <- paste0("Max: y = ", round(a1, 2), " + ", round(b1, 2), "x\n", "R² = ", round(summary(lm_model_max)$r.squared, 3))
+  
+  # --- 新增：计算交点坐标 ---
+  # 公式: a1 + b1*x = a2 + b2*x => x = (a2 - a1) / (b1 - b2)
+  if (b1 != b2) {
+    inter_x <- (a2 - a1) / (b1 - b2)
+    inter_y <- a1 + b1 * inter_x
+    lable_inter <- paste0("Intersection: (", round(inter_x, 2), ", ", round(inter_y, 2), ")")
+  } else {
+    lable_inter <- "Intersection: None (Parallel)"
+  }
+  # -------------------------
+
+  # 创建完整图表
+  final_plot <- ggplot() +
+    geom_ribbon(data = df_summary, aes(x = prevalence, ymin = Target_value_min, ymax = Target_value_max),
+                fill = "grey", alpha = 0.15) +
+    geom_point(data = indata, aes(x = prevalence, y = Target_value, color = Target_value),
+               alpha = 0.6, size = 1.5) + 
+    scale_color_gradient(low = "#93CEDF", high = "#D4693F", name = Target_name) +
+    geom_line(data = df_summary, aes(x = prevalence, y = Target_value_max), color = "#D4693F", size = 1) +
+    geom_line(data = df_summary, aes(x = prevalence, y = Target_value_min), color = "#93CEDF", size = 1) +
+    geom_smooth(data = df_summary, aes(x = prevalence, y = Target_value_min), 
+                method = "lm", formula = y ~ x, se = FALSE, color = "#93CEDF", linetype = "dashed") +
+    geom_smooth(data = df_summary, aes(x = prevalence, y = Target_value_max), 
+                method = "lm", formula = y ~ x, se = FALSE, color = "#D4693F", linetype = "dashed") +
+    # 修改处：在末尾添加交点坐标显示
+    annotate("text", x = Inf, y = Inf, 
+             label = paste(lable_max, lable_min, lable_inter, sep = "\n"),
+             hjust = 1.1, vjust = 1.1, size = 5) +
+    labs(x = "Prevalence", y = Target_name) +
+    theme_bw() + 
+    theme(
+      panel.background = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+      plot.title = element_text(size = 20, face = "bold", color = "black", hjust = 0.5, margin = margin(b = 10)),
+      plot.subtitle = element_text(size = 12, color = "black", hjust = 0.5, lineheight = 1.2, margin = margin(b = 15)),
+      axis.text.x = element_text(size = 14, color = "black"),
+      axis.title.x = element_text(size = 14, color = "black", face = "bold"), 
+      axis.text.y = element_text(size = 14, color = "black", angle = 0), 
+      axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+      legend.title = element_text(size = 14, color = "black"),
+      legend.text = element_text(size = 12, color = "black"),
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10, unit = "pt")
+    )
+    
+  ggsave(out_dir, plot = final_plot, width = 10, height = 5, units = "in")
+  return(final_plot)
+}
+
+# value_prevalence_maxmin(taxonomy_16s_extended[ ,c("prevalence_g","ko_richness_merge")],"Unique KO richness",20)
+# value_prevalence_maxmin(taxonomy_16s_extended[ ,c("prevalence_g","CDS")],"CDS",20)
+value_prevalence_maxmin(taxonomy_16s_extended[ ,c("prevalence_s","ko_richness_genome")],"KO richness",25)
+value_prevalence_maxmin(taxonomy_16s_extended[ ,c("prevalence_s","CDS")],"CDS",25)
+value_prevalence_maxmin(taxonomy_16s_extended[ ,c("prevalence_s","Genome_size")],"Genome size (mbp)",25)
+value_prevalence_maxmin(taxonomy_16s_extended[ ,c("prevalence_s","GC_content")],"GC content (%)",25)
+
+
+# value_prevalence_maxmin(taxonomy_16s_extended[ ,c("prevelence_weight","ko_richness_genome")],"KO richness",25)
+# value_prevalence_maxmin(taxonomy_16s_extended[ ,c("prevalence_s","CDS")],"CDS",25)
+# value_prevalence_maxmin(taxonomy_16s_extended[ ,c("prevalence_s","Genome_size")],"Genome size (mbp)",25)
+# value_prevalence_maxmin(taxonomy_16s_extended[ ,c("prevalence_s","GC_content")],"GC content (%)",25)
+
+
+
+
+envelope_intersection <- function(indata, x_col, y_col, n = 1000) {
+  # 提取列
+  x <- indata[[x_col]]
+  y <- indata[[y_col]]
+  
+  # 存储每次的交点
+  inter_x <- numeric(n)
+  inter_y <- numeric(n)
+  
+  for (i in seq_len(n)) {
+    # 随机打乱 y 列
+    y_shuffled <- sample(y)
+    temp <- setNames(data.frame(x, y_shuffled), c(x_col, y_col))
+    
+    # 构建上下包络点
+    form <- as.formula(paste(y_col, "~", x_col))
+    upper <- aggregate(form, data = temp, FUN = max, na.rm = TRUE)
+    lower <- aggregate(form, data = temp, FUN = min, na.rm = TRUE)
+    
+    # 只有至少两个点才能做线性回归
+    if (nrow(upper) >= 2 && nrow(lower) >= 2) {
+      lm_up <- lm(form, data = upper)
+      a_up <- coef(lm_up)[2]
+      b_up <- coef(lm_up)[1]
+      
+      lm_low <- lm(form, data = lower)
+      a_low <- coef(lm_low)[2]
+      b_low <- coef(lm_low)[1]
+      
+      # 如果两线不平行，计算交点
+      if (abs(a_up - a_low) > 1e-12) {
+        x_int <- (b_low - b_up) / (a_up - a_low)
+        y_int <- a_up * x_int + b_up
+        inter_x[i] <- x_int
+        inter_y[i] <- y_int
+      } else {
+        inter_x[i] <- NA
+        inter_y[i] <- NA
+      }
+    } else {
+      inter_x[i] <- NA
+      inter_y[i] <- NA
+    }
+  }
+  
+  # 计算有效交点的统计量
+  valid <- !is.na(inter_x)
+  n_valid <- sum(valid)
+  
+  if (n_valid > 0) {
+    mean_x <- mean(inter_x, na.rm = TRUE)
+    sd_x   <- sd(inter_x, na.rm = TRUE)
+    mean_y <- mean(inter_y, na.rm = TRUE)
+    sd_y   <- sd(inter_y, na.rm = TRUE)
+  } else {
+    mean_x <- NA
+    sd_x   <- NA
+    mean_y <- NA
+    sd_y   <- NA
+  }
+  
+  # 返回结果表格
+  result <- data.frame(
+    mean_x = mean_x,
+    sd_x   = sd_x,
+    mean_y = mean_y,
+    sd_y   = sd_y,
+    n_valid = n_valid,
+    n_total = n,
+    stringsAsFactors = FALSE
+  )
+  
+  return(result)
+}
+#进行1000次随机包络分析然后计算平均交点位置
+indata = taxonomy_16s_extended[ ,c("prevalence_s","CDS","ko_richness_genome","Genome_size","GC_content")]
+indata = na.omit(indata)
+colnames(indata) = c("prevalence","CDS","KO","Genome_size","GC_content")
+CDS_TEST = envelope_intersection(indata,"prevalence","CDS",1000)
+KO_TEST = envelope_intersection(indata,"prevalence","KO",1000)
+Genome_size_TEST = envelope_intersection(indata,"prevalence","Genome_size",1000)
+GC_TEST = envelope_intersection(indata,"prevalence","GC_content",1000)
+
+
+
+#计算通才和专才分类群的平均CDS和KO_richness
+g_ko_richness = taxonomy_16s_extended$ko_richness_genome[taxonomy_16s_extended$prevalence_s>=6]
+g_CDS = taxonomy_16s_extended$CDS[taxonomy_16s_extended$prevalence_s>=6]
+s_ko_richness = taxonomy_16s_extended$ko_richness_genome[taxonomy_16s_extended$prevalence_s==1]
+s_CDS = taxonomy_16s_extended$CDS[taxonomy_16s_extended$prevalence_s==1]
+g_Genome_size = taxonomy_16s_extended$Genome_size[taxonomy_16s_extended$prevalence_s>=6]
+g_GC_content = taxonomy_16s_extended$GC_content[taxonomy_16s_extended$prevalence_s>=6]
+s_Genome_size = taxonomy_16s_extended$Genome_size[taxonomy_16s_extended$prevalence_s==1]
+s_GC_content = taxonomy_16s_extended$GC_content[taxonomy_16s_extended$prevalence_s==1]
+
+
+g_ko_richness = g_ko_richness[g_ko_richness!=-1]
+g_CDS = g_CDS[g_CDS!=-1]
+s_ko_richness = s_ko_richness[s_ko_richness!=-1]
+s_CDS = s_CDS[s_CDS!=-1]
+
+
+plot_scatter_boxplot <- function(array_a, array_b, 
+                                 lable_a = "lable_a", 
+                                 lable_b = "lable_b", 
+                                 lable_y = "lable_y",
+                                 color_a = "#69b3a2", 
+                                 color_b = "#404080", 
+                                 alpha = 0.3) {
+  
+  # 1. 构造数据框
+  array_a = array_a[!is.na(array_a)]
+  array_b = array_b[!is.na(array_b)]
+  df <- data.frame(
+    value = c(array_a, array_b),
+    group = factor(c(rep(lable_a, length(array_a)), rep(lable_b, length(array_b))),
+                   levels = c(lable_a, lable_b))
+  )
+  
+  # 2. 计算差异显著性 (T-test) 和 效应值 (Cohen's d)
+  test_res <- t.test(array_a, array_b)
+  p_val <- test_res$p.value
+  d_res <- effsize::cohen.d(array_a, array_b, na.rm = TRUE)
+  eff_size <- d_res$estimate
+  
+  # 格式化右上角的文本
+  stats_text <- paste0("p-value: ", format.pval(p_val, digits = 3), 
+                        "  Cohen's d: ", round(eff_size, 3))
+  
+  # 3. 计算每组的平均值和最大值位置
+  # 用于在每组最上方显示平均值
+  summary_info <- data.frame(
+    group = c(lable_a, lable_b),
+    mean_val = c(mean(array_a), mean(array_b)),
+    max_val = c(max(array_a), max(array_b))
+  )
+  
+  # 4. 绘图
+  p <- ggplot(df, aes(x = group, y = value, fill = group, color = group)) +
+    # 绘制箱线图 (隐藏离群点，因为我们会画散点)
+    geom_boxplot(outlier.shape = NA, alpha = 0.4, width = 0.5) +
+    # 绘制抖动散点
+    geom_jitter(width = 0.2, alpha = alpha) +
+    # 设置颜色
+    scale_fill_manual(values = c(color_a, color_b)) +
+    scale_color_manual(values = c(color_a, color_b)) +
+    # 在右上角添加显著性和效应值
+    annotate("text", x = Inf, y = Inf, label = stats_text, 
+             hjust = 1.1, vjust = 1.5, size = 4, fontface = "italic", color = "black") +
+    # 在每组上方显示平均值 (坐标使用该组最大值)
+    geom_text(data = summary_info, 
+              aes(x = group, y = max_val, label = paste("Mean:", round(mean_val, 2))),
+              vjust = -0.5, inherit.aes = FALSE) +
+    # 基础修饰
+    theme_minimal() +
+    theme(legend.position = "none",
+          axis.title.x = element_blank(),
+          panel.grid.minor = element_blank()) +
+    labs(y = lable_y) +
+    # 适当扩大 y 轴范围防止文字被顶栏遮挡
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))+
+    theme_bw() + 
+    theme(
+      panel.background = element_blank(),
+      legend.position = "none",
+      panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+      plot.title = element_text(size = 20, face = "bold", color = "black", hjust = 0.5, margin = margin(b = 10)),
+      plot.subtitle = element_text(size = 12, color = "black", hjust = 0.5, lineheight = 1.2, margin = margin(b = 15)),
+      axis.text.x = element_text(size = 14, color = "black"),
+      axis.title.x = element_text(size = 14, color = "black", face = "bold"), 
+      axis.text.y = element_text(size = 14, color = "black", angle = 0), 
+      axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10, unit = "pt")
+    )
+
+  return(p)
+}
+
+
+library(ggpubr)
+library(patchwork)
+
+p_ko = plot_scatter_boxplot(g_ko_richness,s_ko_richness,"Generalist","Specialist","KO richness")
+p_cds = plot_scatter_boxplot(g_CDS,s_CDS,"Generalist","Specialist","CDS")
+P_Genome_size = plot_scatter_boxplot(g_Genome_size,s_Genome_size,"Generalist","Specialist","Genome size (mpb)")
+P_GC_content = plot_scatter_boxplot(g_GC_content,s_GC_content,"Generalist","Specialist","GC content (%)")
+final_plot_GS <- (p_ko | p_cds )/(P_GC_content | P_Genome_size)
+ggsave("result/Trait_shifts/KO_CDS_GS.pdf",final_plot_GS,width = 10,height = 10)
+final_plot_GS
+```
+
+#ITS Samples
+```{r}
+rm(list = ls())
+source("Tools.R")
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(tidyr)
+library(reshape2)
+library(forcats)
+taxonomy_its_extended = read.delim("standard/taxonomy_its_extended.txt")
+#The relationship between the taxonomic species composition of ITS samples and their prevalence_s rates
+prevalence_s_Class_its = taxonomy_its_extended[ ,c("prevalence_s","Class")]
+prevalence_s_Class_its[prevalence_s_Class_its$prevalence_s >= 15,]$prevalence_s = 15
+make_mutibar(datain = prevalence_s_Class_its,
+             out_dir = "result/Trait_shifts/prevalence_s_Class_change_its.pdf",
+             x_name = "Prevalence",
+             y_name = "Proportion of Taxid",
+             legend_name = "Class",
+             limit_num = 5,
+             width = 7,
+             height = 4,
+             other_list = c("Unassigned","Incertae Sedis","Unknown"),
+             colorlist =  c("#FCB366", "#FE816F", "#90D7C7","#93BCD0", "#AF3F4F", 
+                            "#F3BB34", "#F8AD9A", "#5163B5", "#613767", "#56B394",
+                            "#DC6D73", "#B2B896", "#E97DAE","#FB7A64","#EDCE35", 
+                            "#E5C28C", "#CA8BB6", "#1A6C92", "#EAB46E", "#8CC3BD", 
+                            "#4E56AB","#0FBFBC", "#E9A564", "#ADD565", "#ADADAD", 
+                            "#8F9EC5", "#6C77B5", "#138A8E", "#4B9D77", "#8E60A8")
+)
+Class_test = Calculate_correlation(prevalence_s_Class_its,"prevalence_s","Class")
+class_prop = as.data.frame(table(prevalence_s_Class_its$Class))
+main_class = class_prop$Var1[class_prop$Freq>100]
+Class_test = Class_test[Class_test$Variable%in%main_class,]
+print(Class_test)
+#The relationship between the proportion of mycorrhizal fungi in ITS samples and their prevalence_s rate
+prevalence_s_Mycorrhizal_its = taxonomy_its_extended[ ,c("prevalence_s","mycorrhizal")]
+prevalence_s_Mycorrhizal_its <- prevalence_s_Mycorrhizal_its %>%
+  replace(is.na(.), "Unknown")
+prevalence_s_Mycorrhizal_its[prevalence_s_Mycorrhizal_its$prevalence_s >= 15,]$prevalence_s = 15
+prevalence_s_Mycorrhizal_its[prevalence_s_Mycorrhizal_its$prevalence_s >= 15,]$prevalence_s = 15
+make_mutibar(datain = prevalence_s_Mycorrhizal_its,
+             out_dir = "result/Trait_shifts/prevalence_s_Mycorrhizal_change_its.pdf",
+             x_name = "Prevalence",
+             y_name = "Proportion of Taxid",
+             legend_name = "Mycorrhizal",
+             limit_num = 10,
+             width = 7,
+             height = 4,
+             other_list = c("Unassigned","Incertae Sedis","Unknown"),
+             colorlist = c("#C1D2E2","#4B5B74","#eeeeee")
+)
+Mycorrhizal_test = Calculate_correlation(prevalence_s_Mycorrhizal_its,"prevalence_s","mycorrhizal")
+print(Mycorrhizal_test)
+# 菌根真菌是什么属呢
+mycorrhizal_tax = taxonomy_its_extended[taxonomy_its_extended$mycorrhizal == "TRUE",]
+p1 = draw_pie_chart(mycorrhizal_tax,"Class", label = F, pre = TRUE,
+                   "Mycorrhizal Class",limit_n = 8)
+p1
+ggsave("result/Trait_shifts/Mycorrhizal_Genus_distribution.pdf",p1,width = 6,height = 4)
+# 菌根真菌都在那些植物中分布呢
+# 挑选所有菌根真菌
+library(data.table)
+metadata_its = read.delim("raw/metadata_its.txt")
+sample_taxid_01_its = fread("standard/sample_taxid_01_its.txt")
+sample_taxid_01_its = as.data.frame(column_to_rownames(sample_taxid_01_its,"taxid"))
+mycorrhizal_01_its = sample_taxid_01_its[mycorrhizal_tax$taxid,]
+mycorrhizal_samples = colnames(mycorrhizal_01_its)[colSums(mycorrhizal_01_its)>0]
+mycorrhizal_metadata = metadata_its[metadata_its$SampleID%in%mycorrhizal_samples,]
+p2 = draw_pie_chart(mycorrhizal_metadata,"Genus", label = F, pre = TRUE,
+                   "Mycorrhizal Samples",limit_n = 8)
+p2
+ggsave("result/Trait_shifts/Mycorrhizal_Samples_distribution.pdf",p2,width = 6,height = 4)
+```
+
+
+# Identify which genes have an increased or decreased occurrence rate as the popularity increases or decreases.
+```{r,warning=FALSE}
+rm(list = ls())
+source("Tools.R")
+library(dplyr)
+library(tidyr)
+library(data.table)
+taxonomy_16s_extended = read.delim("standard/taxonomy_16s_extended.txt")
+ko_data = fread("raw/ko_data_genome.txt")
+ko_data = column_to_rownames(as.data.frame(ko_data),"taxid")
+
+ko_data[ko_data != 0] = 1
+type_data = taxonomy_16s_extended[,c("taxid","prevalence_s")]
+type_data$prevalence_s[type_data$prevalence_s >= 25] = 25
+
+indata = merge(type_data,ko_data,by.x = "taxid",by.y = "row.names")
+# 合并数据并计算比例
+result_df <- indata %>%
+  # 将数据转换为长格式以便按流行率分组
+  pivot_longer(cols = -c(taxid, prevalence_s), 
+               names_to = "gene", 
+               values_to = "presence") %>%
+  # 按流行率和基因分组
+  group_by(prevalence_s, gene) %>%
+  # 计算每个组别的比例
+  summarise(
+    proportion = sum(presence == 1, na.rm = TRUE) / n(),
+    .groups = "drop"
+  ) 
+
+result_df <- spread(result_df, key = "gene",
+                    value = "proportion")
+
+# 设置显著性水平（通常为0.05，可根据需要调整）
+alpha <- 0.01
+
+# 初始化存储显著正相关和负相关列名的字符向量
+positive_vars <- character(0)
+negative_vars <- character(0)
+
+# 提取自变量（第一列）和因变量（其他列）
+result_df$prevalence_s = as.numeric(result_df$prevalence_s)
+independent_var <- result_df$prevalence_s
+dependent_df <- result_df[, -1, drop = FALSE]  # 因变量数据框（保持数据框结构）
+
+# 循环遍历每个因变量列
+for (col_name in names(dependent_df)) {
+  dependent_var <- dependent_df[[col_name]]  # 提取当前因变量列
+  
+  # 执行相关性检验（默认使用Pearson，可修改method参数）
+  # 使用tryCatch避免因错误（如缺失值过多）中断循环
+  test_result <- tryCatch({
+    cor.test(independent_var, dependent_var, method = "pearson")  # 可改为"spearman"或"kendall"
+  }, error = function(e) {
+    return(NULL)  # 如果出错（如数据问题），返回NULL
+  })
+  
+  # 跳过出错的列
+  if (is.null(test_result)) next
+  
+  # 提取p值和相关系数
+  p_value <- test_result$p.value
+  cor_coef <- test_result$estimate
+  
+  # 检查是否有效（避免NA值）
+  if (!is.na(p_value) && !is.na(cor_coef)) {
+    # 判断显著性及相关方向
+    if (p_value < alpha) {
+      if (cor_coef > 0) {
+        positive_vars <- c(positive_vars, col_name)  # 显著正相关
+      } else if (cor_coef < 0) {
+        negative_vars <- c(negative_vars, col_name)  # 显著负相关
+      }
+    }
+  }
+}
+
+#导入kegg分类信息
+ko_level_table = read.delim("db/ko_level_table.txt")
+p_ko_level = ko_level_table[ko_level_table$KO%in%positive_vars,]
+write.table(p_ko_level,file = "result/Trait_shifts/p_ko_level.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+n_ko_level = ko_level_table[ko_level_table$KO%in%negative_vars,]
+write.table(n_ko_level,file = "result/Trait_shifts/n_ko_level.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+#对比level3下前20正相关基因和负相关基因的差异
+freq_table <- table(p_ko_level$level3)
+sorted_freq <- sort(freq_table, decreasing = TRUE)
+p_level3_10 <- names(sorted_freq)[1:10]
+freq_table <- table(n_ko_level$level3)
+sorted_freq <- sort(freq_table, decreasing = TRUE)
+n_level3_10 <- names(sorted_freq)[1:10]
+# 提取p_level3_10独有的元素
+p_level3_10_unique <- setdiff(p_level3_10, n_level3_10)
+p_level3_10_unique
+
+# 提取n_level3_10独有的元素
+n_level3_10_unique <- setdiff(n_level3_10, p_level3_10)
+n_level3_10_unique
+
+# 共有的功能
+common_func = intersect(n_level3_10, p_level3_10)
+common_func
+```
+# Annotate and visualize the genes with significant differences
+```{r}
+rm(list = ls())
+source("Tools.R")
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+p_ko_level = read.delim("result/Trait_shifts/p_ko_level.txt")
+length(unique(p_ko_level$KO))
+n_ko_level = read.delim("result/Trait_shifts/n_ko_level.txt")
+length(unique(n_ko_level$KO))
+p_ko_pathway = as.data.frame(table(p_ko_level$level3))
+colnames(p_ko_pathway)[1] = "Pathway"
+p_ko_pathway = p_ko_pathway[order(p_ko_pathway$Freq, decreasing = TRUE), ][c(1:15),]
+n_ko_pathway = as.data.frame(table(n_ko_level$level3))
+colnames(n_ko_pathway)[1] = "Pathway"
+n_ko_pathway = n_ko_pathway[order(n_ko_pathway$Freq, decreasing = TRUE), ][c(1:15),]
+
+colnames(p_ko_pathway)[2] = "p_freq"
+colnames(n_ko_pathway)[2] = "n_freq"
+
+pn_ko_pathway = merge(p_ko_pathway,n_ko_pathway,by = "Pathway",all = T)
+pn_ko_pathway[is.na(pn_ko_pathway)] = 0
+mutal_pathway = pn_ko_pathway[pn_ko_pathway$Pathway%in%intersect(p_ko_pathway$Pathway,n_ko_pathway$Pathway),]
+mutal_pathway$diff = mutal_pathway$p_freq-mutal_pathway$n_freq
+mutal_pathway = mutal_pathway[order(-mutal_pathway$diff), ][ ,-4]
+p_pathway = pn_ko_pathway[pn_ko_pathway$Pathway%in%setdiff(p_ko_pathway$Pathway,n_ko_pathway$Pathway),]
+p_pathway <- p_pathway[order(-p_pathway$p_freq), ]
+n_pathway = pn_ko_pathway[pn_ko_pathway$Pathway%in%setdiff(n_ko_pathway$Pathway,p_ko_pathway$Pathway),]
+n_pathway <- n_pathway[order(n_pathway$n_freq), ]
+pn_ko_pathway_order = rbind(p_pathway,mutal_pathway,n_pathway)
+
+df_long <- pivot_longer(pn_ko_pathway_order, 
+                        cols = c(p_freq, n_freq), 
+                        names_to = "variable", 
+                        values_to = "value")
+
+df_long$Pathway <- factor(df_long$Pathway, levels = pn_ko_pathway_order$Pathway)
+df_long$variable <- factor(df_long$variable, levels =c("p_freq","n_freq"))
+
+# Plot
+ggplot(df_long, aes(x = Pathway, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(x = "Pathway", y = "Occurrence Rate", title = "", fill = "") +
+  scale_fill_manual(values = c("p_freq" = "#DE7117", "n_freq" = "#355070")) +
+  theme_classic() +
+  theme(
+    legend.position = "top",
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+    axis.text.x  = element_text(size = 14, color = "black", angle = -45, hjust = 0, vjust = 1),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y  = element_text(size = 14, color = "black"),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14, color = "black"),
+    legend.text  = element_text(size = 14, color = "black"),
+    plot.margin  = margin(t = 10, r = 130, b = 10, l = 10, unit = "pt")
+  )
+ggsave("result/Trait_shifts/pn_ko_pathway.pdf",width = 15,height = 6)
+
+
+
+pgpg_levels = read.delim("db/pgpg_levels.txt")
+p_ko_pgpg = pgpg_levels[pgpg_levels$KO%in%p_ko_level$KO,]
+n_ko_pgpg = pgpg_levels[pgpg_levels$KO%in%n_ko_level$KO,]
+
+freq_table_Lv3_p = as.data.frame(table(p_ko_pgpg$Lv3))
+freq_table_Lv3_n = as.data.frame(table(n_ko_pgpg$Lv3))
+
+colnames(freq_table_Lv3_p)[1] = "PGPG_Function"
+freq_table_Lv3_p = freq_table_Lv3_p[order(freq_table_Lv3_p$Freq, decreasing = TRUE), ][c(1:15),]
+colnames(freq_table_Lv3_n)[1] = "PGPG_Function"
+freq_table_Lv3_n = freq_table_Lv3_n[order(freq_table_Lv3_n$Freq, decreasing = TRUE), ][c(1:15),]
+
+
+colnames(freq_table_Lv3_p)[2] = "p_freq"
+colnames(freq_table_Lv3_n)[2] = "n_freq"
+
+pn_ko_PGPG_Function = merge(freq_table_Lv3_p,freq_table_Lv3_n,by = "PGPG_Function",all = T)
+pn_ko_PGPG_Function[is.na(pn_ko_PGPG_Function)] = 0
+mutal_PGPG_Function = pn_ko_PGPG_Function[pn_ko_PGPG_Function$PGPG_Function%in%intersect(freq_table_Lv3_p$PGPG_Function,freq_table_Lv3_n$PGPG_Function),]
+mutal_PGPG_Function$diff = mutal_PGPG_Function$p_freq-mutal_PGPG_Function$n_freq
+mutal_PGPG_Function = mutal_PGPG_Function[order(-mutal_PGPG_Function$diff), ][ ,-4]
+p_PGPG_Function = pn_ko_PGPG_Function[pn_ko_PGPG_Function$PGPG_Function%in%setdiff(freq_table_Lv3_p$PGPG_Function,freq_table_Lv3_n$PGPG_Function),]
+p_PGPG_Function <- p_PGPG_Function[order(-p_PGPG_Function$p_freq), ]
+n_PGPG_Function = pn_ko_PGPG_Function[pn_ko_PGPG_Function$PGPG_Function%in%setdiff(freq_table_Lv3_n$PGPG_Function,freq_table_Lv3_p$PGPG_Function),]
+n_PGPG_Function <- n_PGPG_Function[order(n_PGPG_Function$n_freq), ]
+pn_ko_PGPG_Function_order = rbind(p_PGPG_Function,mutal_PGPG_Function,n_PGPG_Function)
+
+df_long <- pivot_longer(pn_ko_PGPG_Function_order, 
+                        cols = c(p_freq, n_freq), 
+                        names_to = "variable", 
+                        values_to = "value")
+
+df_long$PGPG_Function <- factor(df_long$PGPG_Function, levels = pn_ko_PGPG_Function_order$PGPG_Function)
+df_long$variable <- factor(df_long$variable, levels =c("p_freq","n_freq"))
+
+# Plot
+ggplot(df_long, aes(x = PGPG_Function, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(x = "PGPG_Function", y = "Occurrence Rate", title = "", fill = "") +
+  scale_fill_manual(values = c("p_freq" = "#DE7117", "n_freq" = "#355070")) +
+  theme_classic() +
+  theme(
+    legend.position = "top",
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+    axis.text.x  = element_text(size = 14, color = "black", angle = -45, hjust = 0, vjust = 1),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y  = element_text(size = 14, color = "black"),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14, color = "black"),
+    legend.text  = element_text(size = 14, color = "black"),
+    plot.margin  = margin(t = 10, r = 150, b = 10, l = 10, unit = "pt")
+  )
+ggsave("result/Trait_shifts/pn_ko_PGPG_Function.pdf",width = 15,height = 8)
+
+writeLines(as.character(pn_ko_pathway_order$Pathway),"result/Trait_shifts/pn_pathway.txt")
+writeLines(as.character(pn_ko_PGPG_Function_order$PGPG_Function),"result/Trait_shifts/pn_PGPG.txt")
+```
+
+
+# Observe the storage situation of nitrogen-fixing bacteria in different plants
+```{r,fig.show='animate'}
+rm(list = ls())
+source("Tools.R")
+library(tidyr)
+library(tibble)
+library(tidyverse)
+library(ComplexHeatmap)
+library(ape)
+dir.create("result/nitrogen_fixation")
+nf = read.delim("db/nitrogen_genus.txt")
+annotation_g_16s = read.delim("result/GOS/tree_g_16s/annotation_g_16s.txt")
+metadata_16s <- read.delim("raw/metadata_16s.txt")
+taxonomy_16s_extended <- read.delim("standard/taxonomy_16s_extended.txt")
+PS_taxid_01_16s = read.delim("standard/PS_taxid_01_16s.txt")
+# PG_taxid_01_16s = read.delim("standard/PG_taxid_01_16s.txt")
+PG_MG_sum_16s = merge_datafame(PS_taxid_01_16s,row_group = taxonomy_16s_extended[ ,c("taxid","Genus")],
+                               row_method = "sum",col_group = unique(metadata_16s[ ,c("Species","Genus")]),col_method = "sum")
+rownames(PG_MG_sum_16s)[which(rownames(PG_MG_sum_16s) == "Burkholderia-Caballeronia-Paraburkholderia")] <- "Burkholderia"
+#Identify which generalists are nitrogen-fixing bacteria?
+generalist_nf_genus = intersect(unique(annotation_g_16s$Genus),nf$Genus)
+print("The overlapping number of the Nitrogen-fixing Bacteria genus and the Generalist Microorganism genus is:")
+length(generalist_nf_genus)
+
+
+# Convert it into a matrix, which is the required data format for the pheatmap function.
+PG_NF_sum_16s = PG_MG_sum_16s[nf$Genus, ]
+PG_NF_sum_16s[PG_NF_sum_16s != 0] <- 1
+PG_NF_sum_16s = PG_NF_sum_16s[rowSums(PG_NF_sum_16s)>0,]
+# Count the number of plant genera that possess all three types of nitrogen-fixing bacteria simultaneously
+three_type = merge_datafame(PG_NF_sum_16s,row_group = nf[nf$Genus%in%rownames(PG_NF_sum_16s),][ ,c(2,1)],row_method = "sum")
+three_type[three_type!=0] = 1
+three_type_nf_genus = colnames(three_type)[colSums(three_type)==3]
+print("Count the number of plant genera that possess all three types of nitrogen-fixing bacteria simultaneously")
+length(three_type_nf_genus)
+# Average nitrogen-fixing bacteria holdings
+mean(colSums(PG_NF_sum_16s))
+# The average holdings of three types of rhizobia in the Gramineae and Leguminosae families
+genus_list = c("Poales","Fabales")
+type_list = unique(nf$classify)
+for (pg in genus_list){
+  pglist = unique(metadata_16s$Genus[metadata_16s$Order==pg])
+  for (nt in type_list){
+    ntgenus = nf$Genus[nf$classify==nt]
+    ntgenus = intersect(ntgenus,rownames(PG_NF_sum_16s))
+    temp_matrix = PG_NF_sum_16s[ntgenus,pglist]
+    mean_val = mean(colSums(temp_matrix))
+    print(paste0(pg," - ",nt," = ",mean_val))
+  }
+}
+
+
+# Draw a heat map to visualize the distribution of nitrogen-fixing bacteria
+colnames(PG_NF_sum_16s) = paste(colnames(PG_NF_sum_16s),colSums(PG_NF_sum_16s),sep = "_")
+rownames(PG_NF_sum_16s) = paste(rownames(PG_NF_sum_16s),rowSums(PG_NF_sum_16s),sep = "_")
+# Initialize the color matrix (set all values to white, corresponding to 0)
+Host_order = colnames(PG_NF_sum_16s)[order(colSums(PG_NF_sum_16s), decreasing = TRUE)]
+PG_NF_sum_16s = PG_NF_sum_16s[ ,Host_order]
+mat <- as.matrix(t(PG_NF_sum_16s))
+color_mat <- matrix("#FFFFFF", nrow = nrow(mat), ncol = ncol(mat))
+# Set the color of the middle values in different column intervals to 1.
+color_mat[, 1:13][mat[, 1:13] == 1]   <- "#FE816F"
+color_mat[, 14:20][mat[, 14:20] == 1] <- "#90D7C7"
+color_mat[, 21:34][mat[, 21:34] == 1] <- "#FCB366"
+Genus_order_raw = data.frame(Genus = colnames(mat),raw_index = c(1:ncol(mat)))
+# Version sorted by quantity
+# Sorting of host nitrogen-fixing bacteria holdings
+NF_order1 = c(rownames(PG_NF_sum_16s[1:13,])[order(rowSums(PG_NF_sum_16s[1:13,]), decreasing = TRUE)],
+              rownames(PG_NF_sum_16s[14:20,])[order(rowSums(PG_NF_sum_16s[14:20,]), decreasing = TRUE)],
+              rownames(PG_NF_sum_16s[21:34,])[order(rowSums(PG_NF_sum_16s[21:34,]), decreasing = TRUE)])
+Genus_order_1 = data.frame(Genus = NF_order1,order_index1 = c(1:length(NF_order1)))
+NF_order2 = rownames(PG_NF_sum_16s)[order(rowSums(PG_NF_sum_16s), decreasing = TRUE)]
+Genus_order_2 = data.frame(Genus = NF_order2,order_index2 = c(1:length(NF_order2)))
+Genus_order_merge = merge(Genus_order_raw,Genus_order_1,by = "Genus")
+Genus_order_merge = merge(Genus_order_merge,Genus_order_2,by = "Genus")
+color_mat1 = color_mat[ ,Genus_order_merge$raw_index[order(Genus_order_merge$order_index1)]]
+color_mat2 = color_mat[ ,Genus_order_merge$raw_index[order(Genus_order_merge$order_index2)]]
+mat1 = mat[ ,NF_order1]
+mat2 = mat[ ,NF_order2]
+
+ha <- HeatmapAnnotation(
+  Types = c(rep("Symbiotic", 13),
+               rep("Free-living", 7),
+               rep("Associative", 14)),
+  col = list(
+    Types = c(
+      "Symbiotic" = "#FE816F",
+      "Free-living" = "#90D7C7",
+      "Associative" = "#FCB366"
+    )
+  ),
+  show_legend = FALSE
+)
+# 绘制热图
+
+pdf("result/nitrogen_fixation/nitrogen_fixation_heatmap1.pdf", width = 13, height = 18) 
+Heatmap(mat1,
+        rect_gp = grid::gpar(fill = color_mat1, col = "grey80", lwd = 0.5),
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        top_annotation = ha,
+        show_row_names = TRUE,
+        show_heatmap_legend = FALSE)
+dev.off()
+pdf("result/nitrogen_fixation/nitrogen_fixation_heatmap2.pdf", width = 10, height = 16) 
+Heatmap(mat2,
+        rect_gp = grid::gpar(fill = color_mat2, col = "grey80", lwd = 0.5),
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        # top_annotation = ha,
+        show_row_names = TRUE,
+        show_heatmap_legend = FALSE)
+dev.off()
+Heatmap(mat1,
+        rect_gp = grid::gpar(fill = color_mat1, col = "grey80", lwd = 0.5),
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        top_annotation = ha,
+        show_row_names = TRUE,
+        show_heatmap_legend = FALSE)
+
+
+
+# Take a look at the holdings of nitrogen-fixing genes in generalist microorganisms
+library(data.table)
+library(tibble)
+nf_gene = read.delim("db/nf_gene.txt")
+ko_data = fread("raw/ko_data_genome.txt")
+ko_data = column_to_rownames(as.data.frame(ko_data),"taxid")
+annotation_g_16s = read.delim("result/GOS/tree_g_16s/annotation_g_16s.txt",row.names = 1)
+annotation_g_16s$Genus[annotation_g_16s$Genus=="Burkholderia-Caballeronia-Paraburkholderia"] = "Burkholderia"
+ko_data_g_nf = ko_data[rownames(annotation_g_16s),nf_gene$KO]
+ko_data_g_nf = na.omit(ko_data_g_nf)
+ko_data_g_nf[ko_data_g_nf!=0]=1
+ko_data_g_nf_DHK = ko_data_g_nf[rowSums(ko_data_g_nf[ ,c(1:6)])>0,]
+colnames(ko_data_g_nf_DHK) = nf_gene$gene
+ko_data_g_nf_DHK = ko_data_g_nf_DHK[order(rowSums(ko_data_g_nf_DHK),decreasing = TRUE),]
+rownames(ko_data_g_nf_DHK) = make_unique_sequential(annotation_g_16s[rownames(ko_data_g_nf_DHK),]$Genus)
+
+
+
+mat <- as.matrix(ko_data_g_nf_DHK)
+color_mat <- matrix("#FFFFFF", nrow = nrow(mat), ncol = ncol(mat))
+# 设置不同列区间中值为1的颜色
+color_mat[, 1:6][mat[, 1:6] == 1]   <- "#E5A984"
+color_mat[, 7:21][mat[, 7:21] == 1] <- "#F7E09B"
+color_mat[, 22:27][mat[, 22:27] == 1] <- "#808DAA"
+ha <- HeatmapAnnotation(
+  Types = c(rep("Core nif genes", 6),
+               rep("Auxiliary nif genes", 15),
+               rep("Nod-related genes", 6)),
+  col = list(
+    Types = c(
+      "Core nif genes" = "#E5A984",
+      "Auxiliary nif genes" = "#F7E09B",
+      "Nod-related genes" = "#808DAA"
+    )
+  ),
+  show_legend = FALSE
+)
+pdf("result/nitrogen_fixation/generalist_nitrogen_gene.pdf", width = 10, height = 8) 
+Heatmap(mat,
+        rect_gp = grid::gpar(fill = color_mat, col = "grey80", lwd = 0.5),
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        top_annotation = ha,
+        show_row_names = TRUE,
+        show_heatmap_legend = FALSE)
+dev.off()
+Heatmap(mat,
+        rect_gp = grid::gpar(fill = color_mat, col = "grey80", lwd = 0.5),
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        top_annotation = ha,
+        show_row_names = TRUE,
+        show_heatmap_legend = FALSE)
+
+ko_data_g_nf$sum = rowSums(ko_data_g_nf[ ,c(1:27)])
+ko_data_g_nf$nod = rowSums(ko_data_g_nf[ ,c(22:27)])
+ko_data_g_nf$nif = rowSums(ko_data_g_nf[ ,c(1:21)])
+ko_data_g_nf$HDK = rowSums(ko_data_g_nf[ ,c(1:6)])
+
+nf_g_tax = merge(annotation_g_16s[ ,c(1:10)],ko_data_g_nf[ ,c("sum","nod","nif","HDK")],by = "row.names")
+#含有固氮酶的通才的数量
+sum(nf_g_tax$nod>0)
+sum(nf_g_tax$nif>0)
+sum(nf_g_tax$HDK>0)
+sum(nf_g_tax$nod>0&nf_g_tax$HDK>0)
+```
+
+
+# Draw a heatmap of microbial functions
+```{r,fig.show='animate'}
+rm(list = ls())
+library(pheatmap)
+library(ComplexHeatmap)
+micro_function    <- read.delim("raw/micro_function.txt")
+micro_function_merge <- micro_function %>%
+  group_by(Genus) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  column_to_rownames(var = "Genus")
+taxonomy_16s_extended <- read.delim("standard/taxonomy_16s_extended.txt")
+taxonomy_its_extended <- read.delim("standard/taxonomy_its_extended.txt")
+
+high_prevalence_16s <- unique(taxonomy_16s_extended$Genus[taxonomy_16s_extended$GOS_s=="generalist"])
+high_prevalence_16s[high_prevalence_16s=="Burkholderia-Caballeronia-Paraburkholderia"] = "Burkholderia"
+high_prevalence_its <- unique(taxonomy_its_extended$Genus[taxonomy_its_extended$GOS_s=="generalist"])
+
+micro_function_merge_16s <- micro_function_merge[high_prevalence_16s, ]
+micro_function_merge_16s <- na.omit(micro_function_merge_16s)
+micro_function_merge_16s <- micro_function_merge_16s[rowSums(micro_function_merge_16s != 0) > 0, ]
+#按照功能丰富度进行排序
+micro_function_01_16s = micro_function_merge_16s
+micro_function_01_16s[micro_function_01_16s!=0] = 1
+micro_function_merge_16s = micro_function_merge_16s[order(rowSums(micro_function_01_16s),decreasing = TRUE), ]
+
+micro_function_merge_its <- micro_function_merge[high_prevalence_its, ]
+micro_function_merge_its <- na.omit(micro_function_merge_its)
+micro_function_merge_its <- micro_function_merge_its[rowSums(micro_function_merge_its != 0) > 0, ]
+#按照功能丰富度进行排序
+micro_function_01_its = micro_function_merge_its
+micro_function_01_its[micro_function_01_its!=0] = 1
+micro_function_merge_its = micro_function_merge_its[order(rowSums(micro_function_01_its),decreasing = TRUE), ]
+
+
+mat_16s = as.matrix(micro_function_merge_16s)
+color_mat_16s <- matrix("#FFFFFF", nrow = nrow(mat_16s), ncol = ncol(mat_16s))
+
+# 设置不同列区间中值为1的颜色
+color_mat_16s[, 1:12][mat_16s[, 1:12] == 1]   <- "#E5F5E0"
+color_mat_16s[, 1:12][mat_16s[, 1:12] == 2]   <- "#C7E9C0"
+color_mat_16s[, 1:12][mat_16s[, 1:12] == 3]   <- "#A1D99B"
+color_mat_16s[, 1:12][mat_16s[, 1:12] == 4]   <- "#74C476"
+color_mat_16s[, 1:12][mat_16s[, 1:12] >= 5]   <- "#41AB5D"
+color_mat_16s[, 13][mat_16s[, 13] == 1]   <- "#F5E5E0"
+color_mat_16s[, 13][mat_16s[, 13] == 2]   <- "#E9C7C0"
+color_mat_16s[, 13][mat_16s[, 13] == 3]   <- "#D9A19B"
+color_mat_16s[, 13][mat_16s[, 13] == 4]   <- "#C47476"
+color_mat_16s[, 13][mat_16s[, 13] >= 5]   <- "#AB415D"
+dir.create("result/article_function")
+pdf("result/article_function/article_function_16s.pdf", width = 10, height = 10.1) 
+Heatmap(mat_16s,
+        rect_gp = grid::gpar(fill = color_mat_16s, col = "grey80", lwd = 0.5),
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = TRUE,
+        show_heatmap_legend = FALSE,
+        cell_fun = function(j, i, x, y, width, height, fill) {
+    if (mat_16s[i, j] > 0) {
+      grid.text(label = mat_16s[i, j], x = x, y = y, gp = gpar(fontsize = 8))
+    }
+  })
+dev.off()
+Heatmap(mat_16s,
+        rect_gp = grid::gpar(fill = color_mat_16s, col = "grey80", lwd = 0.5),
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = TRUE,
+        show_heatmap_legend = FALSE,
+        cell_fun = function(j, i, x, y, width, height, fill) {
+    if (mat_16s[i, j] > 0) {
+      grid.text(label = mat_16s[i, j], x = x, y = y, gp = gpar(fontsize = 8))
+    }
+  })
+
+mat_its = as.matrix(micro_function_merge_its)
+color_mat_its <- matrix("#FFFFFF", nrow = nrow(mat_its), ncol = ncol(mat_its))
+
+# 设置不同列区间中值为1的颜色
+color_mat_its[, 1:12][mat_its[, 1:12] == 1]   <- "#E5F5E0"
+color_mat_its[, 1:12][mat_its[, 1:12] == 2]   <- "#C7E9C0"
+color_mat_its[, 1:12][mat_its[, 1:12] == 3]   <- "#A1D99B"
+color_mat_its[, 1:12][mat_its[, 1:12] == 4]   <- "#74C476"
+color_mat_its[, 1:12][mat_its[, 1:12] >= 5]   <- "#41AB5D"
+color_mat_its[, 13][mat_its[, 13] == 1]   <- "#F5E5E0"
+color_mat_its[, 13][mat_its[, 13] == 2]   <- "#E9C7C0"
+color_mat_its[, 13][mat_its[, 13] == 3]   <- "#D9A19B"
+color_mat_its[, 13][mat_its[, 13] == 4]   <- "#C47476"
+color_mat_its[, 13][mat_its[, 13] >= 5]   <- "#AB415D"
+
+pdf("result/article_function/article_function_its.pdf", width = 8, height = 4.5) 
+Heatmap(mat_its,
+        rect_gp = grid::gpar(fill = color_mat_its, col = "grey80", lwd = 0.5),
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = TRUE,
+        show_heatmap_legend = FALSE,
+        cell_fun = function(j, i, x, y, width, height, fill) {
+    if (mat_its[i, j] > 0) {
+      grid.text(label = mat_its[i, j], x = x, y = y, gp = gpar(fontsize = 8))
+    }
+  })
+dev.off()
+Heatmap(mat_its,
+        rect_gp = grid::gpar(fill = color_mat_its, col = "grey80", lwd = 0.5),
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = TRUE,
+        show_heatmap_legend = FALSE,
+        cell_fun = function(j, i, x, y, width, height, fill) {
+    if (mat_its[i, j] > 0) {
+      grid.text(label = mat_its[i, j], x = x, y = y, gp = gpar(fontsize = 8))
+    }
+  })
+```
+
+
+# The relationship between YAS strategy score and prevalence rate
+```{r}
+
+rm(list = ls())
+source("Tools.R")
+cds_data = read.delim("raw/cds_data.txt")
+taxonomy_16s_extended <- read.delim("standard/taxonomy_16s_extended.txt")
+trait_matrixatgranularity1 = read.csv("raw/micortrait_otuput/microtrait_granularity1.csv",row.names = 1)
+#Calculate the YAS score
+Y_score <- rowSums(trait_matrixatgranularity1[, grepl("Resource\\.Use", names(trait_matrixatgranularity1))])
+A_score <- rowSums(trait_matrixatgranularity1[, grepl("Resource\\.Acquisition", names(trait_matrixatgranularity1))])
+S_score <- rowSums(trait_matrixatgranularity1[, grepl("Stress\\.Tolerance", names(trait_matrixatgranularity1))])
+YAS_score = data.frame(row.names = rownames(trait_matrixatgranularity1),
+                       Y = Y_score,
+                       A = A_score,
+                       S = S_score)
+YAS_score$sum = rowSums(YAS_score)
+YAS_score = merge(cds_data,YAS_score,by.x = "genome_name",by.y = "row.names",all.x = TRUE)
+YAS_score = na.omit(YAS_score)
+YAS_score$Y_ra = YAS_score$Y/YAS_score$CDS
+YAS_score$A_ra = YAS_score$A/YAS_score$CDS
+YAS_score$S_ra = YAS_score$S/YAS_score$CDS
+
+cor.test(YAS_score$Y_ra, YAS_score$CDS, method = "pearson")
+cor.test(YAS_score$A_ra, YAS_score$CDS, method = "pearson")
+cor.test(YAS_score$S_ra, YAS_score$CDS, method = "pearson")
+
+cor.test(YAS_score$Y_ra, YAS_score$CDS, method = "spearman")
+cor.test(YAS_score$A_ra, YAS_score$CDS, method = "spearman")
+cor.test(YAS_score$S_ra, YAS_score$CDS, method = "spearman")
+
+YAS_score_prevalence = merge(YAS_score,taxonomy_16s_extended[ ,c("taxid","prevalence_s")],by="taxid",all.x = TRUE)
+YAS_score_prevalence$prevalence_s[YAS_score_prevalence$prevalence_s>25]=25
+
+Y_result = tukey_boxplot(df = YAS_score_prevalence, group_col = "prevalence_s", value_col = "Y_ra", 
+              fill_color = "#F8AD9A",point_color = "#FE816F", point_alpha = 0.2, HSD = F, 
+              xlab = "Prevalence", ylab = "Yield score", tlab = "Prevalence-Yield score",
+              tilted = F,force = F, MAXLAB = FALSE,rmargin=30,show_n = F,order = F)
+A_result = tukey_boxplot(df = YAS_score_prevalence, group_col = "prevalence_s", value_col = "A_ra", 
+              fill_color = "#EBD7A5",point_color = "#E4A644", point_alpha = 0.2, HSD = F, 
+              xlab = "Prevalence", ylab = "Acquisition score", tlab = "Prevalence-Acquisition score",
+              tilted = F,force = F, MAXLAB = FALSE,rmargin=30,show_n = F,order = F)
+S_result = tukey_boxplot(df = YAS_score_prevalence, group_col = "prevalence_s", value_col = "S_ra", 
+              fill_color = "#93BCD0",point_color = "#1A6C92", point_alpha = 0.2, HSD = F, 
+              xlab = "Prevalence", ylab = "Stresstolerance score", tlab = "Prevalence-Stresstolerance score",
+              tilted = F,force = F, MAXLAB = FALSE,rmargin=30,show_n = F,order = F)
+Y_result[[2]]
+A_result[[2]]
+S_result[[2]]
+
+cor_test <- cul_cor_df(YAS_score_prevalence,"prevalence_s")
+
+dir.create("result/YAS")
+A_plot = A_result[[2]]+
+  annotate("text", x = Inf, y = Inf, 
+            label = paste0("spearman p: ",ifsig(cor_test["A_ra","spearman_p"])),
+            hjust = 1.1, vjust = 1.5, size = 5) 
+ggsave("result/YAS/A_plot.pdf",A_plot,width = 8,height = 4)
+Y_plot = Y_result[[2]]+
+  annotate("text", x = Inf, y = Inf, 
+            label = paste0("spearman p: ",ifsig(cor_test["Y_ra","spearman_p"])),
+            hjust = 1.1, vjust = 1.5, size = 5) 
+ggsave("result/YAS/Y_plot.pdf",Y_plot,width = 8,height = 4)
+S_plot = S_result[[2]]+
+  annotate("text", x = Inf, y = Inf, 
+            label = paste0("spearman p: ",ifsig(cor_test["S_ra","spearman_p"])),
+            hjust = 1.1, vjust = 1.5, size = 5) 
+ggsave("result/YAS/S_plot.pdf",S_plot,width = 8,height = 4)
+```
+
+# The relationship between the occurrence frequency and prevalence of YAS-related micro-traits
+```{r}
+rm(list = ls())
+source("Tools.R")
+library(dplyr)
+library(tidyr)
+library(data.table)
+cds_data = read.delim("raw/cds_data.txt")
+trait_matrixatgranularity3 = read.csv("raw/micortrait_otuput/microtrait_granularity3.csv",row.names = 1)
+taxonomy_16s_extended = read.delim("standard/taxonomy_16s_extended.txt")
+taxid_trait_3 = merge(cds_data[,c(1,2)],trait_matrixatgranularity3,by.x = "genome_name",by.y = "row.names",all.x = TRUE)[,-1]
+taxid_trait_3 = tibble::column_to_rownames(taxid_trait_3,"taxid")
+
+
+taxid_trait_3[taxid_trait_3 != 0] = 1
+type_data = taxonomy_16s_extended[,c("taxid","prevalence_s")]
+type_data$prevalence_s[type_data$prevalence_s >= 25] = 25
+indata = merge(type_data,taxid_trait_3,by.x = "taxid",by.y = "row.names")
+
+result_df <- indata %>%
+  pivot_longer(cols = -c(taxid, prevalence_s), 
+               names_to = "gene", 
+               values_to = "presence") %>%
+  group_by(prevalence_s, gene) %>%
+  summarise(
+    proportion = sum(presence == 1, na.rm = TRUE) / n(),
+    .groups = "drop"
+  ) 
+
+result_df <- spread(result_df, key = "gene",
+                    value = "proportion")
+
+# Set the significance level
+alpha <- 0.01
+
+# Initialize a character vector to store the names of the significantly positively correlated and negatively correlated columns
+positive_vars <- character(0)
+negative_vars <- character(0)
+
+# Extract the independent variable (in the first column) and the dependent variable (in the other columns)
+result_df$prevalence_s = as.numeric(result_df$prevalence_s)
+independent_var <- result_df$prevalence_s
+dependent_df <- result_df[, -1, drop = FALSE] 
+
+
+for (col_name in names(dependent_df)) {
+  dependent_var <- dependent_df[[col_name]]
+  test_result <- tryCatch({
+    cor.test(independent_var, dependent_var, method = "pearson")
+  }, error = function(e) {
+    return(NULL) 
+  })
+  if (is.null(test_result)) next
+  p_value <- test_result$p.value
+  cor_coef <- test_result$estimate
+  if (!is.na(p_value) && !is.na(cor_coef)) {
+    if (p_value < alpha) {
+      if (cor_coef > 0) {
+        positive_vars <- c(positive_vars, col_name)
+      } else if (cor_coef < 0) {
+        negative_vars <- c(negative_vars, col_name)
+      }
+    }
+  }
+}
+sig_microtrait = data.frame(micro_trait = c(positive_vars,negative_vars),cor = c(rep("positive",length(positive_vars)),rep("negative",length(negative_vars))))
+sig_microtrait$type = "unknown"
+sig_microtrait$type[grepl("Resource\\.Use", sig_microtrait$micro_trait)] = "Yield"
+sig_microtrait$type[grepl("Resource\\.Acquisition", sig_microtrait$micro_trait)] = "Resource Acquisition"
+sig_microtrait$type[grepl("Stress\\.Tolerance", sig_microtrait$micro_trait)] = "Stress Tolerance"
+write.table(sig_microtrait,file = "result/Trait_shifts/Table_s3_sig_microtrait.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+# The number of times each trait corresponding to the YAS strategy appears in the positively correlated micro-traits
+sum(grepl("Resource\\.Use", positive_vars))
+sum(grepl("Resource\\.Acquisition", positive_vars))
+sum(grepl("Stress\\.Tolerance", positive_vars))
+# The number of times each trait corresponding to the YAS strategy appears in the negatively correlated micro-traits
+sum(grepl("Resource\\.Use", positive_vars))
+sum(grepl("Resource\\.Use", negative_vars))
+sum(grepl("Resource\\.Acquisition", negative_vars))
+sum(grepl("Stress\\.Tolerance", negative_vars))
+```
+
+# Study the relationship between the proportion of PGPT in the genome and the changes in its prevalence
+```{r}
+library(tibble)
+library(tidyverse)
+source("Tools.R")
+cds_data = read.delim("raw/cds_data.txt")
+pgpg_levels = read.delim("db/pgpg_levels.txt")
+taxonomy_16s_extended = read.delim("standard/taxonomy_16s_extended.txt")
+gene_counts_lv4 = t(read.delim("raw/pgpg_finder_output/gene_counts_Lv4.txt",row.names = 1))
+gene_counts_lv4_counts = column_to_rownames(merge(cds_data,gene_counts_lv4,by.x = "genome_name",by.y = "row.names",all.x = TRUE),"taxid")[ ,-1]
+gene_counts_lv4_normalized = apply(gene_counts_lv4_counts[ , -1], 2, function(x) x / gene_counts_lv4_counts[ , 1])
+gene_counts_lv4_normalized = as.data.frame(t(gene_counts_lv4_normalized))
+
+gene_counts_lv3 = t(read.delim("raw/pgpg_finder_output/gene_counts_lv3.txt",row.names = 1))
+gene_counts_lv3_counts = column_to_rownames(merge(cds_data,gene_counts_lv3,by.x = "genome_name",by.y = "row.names",all.x = TRUE),"taxid")[ ,-1]
+gene_counts_lv3_normalized = apply(gene_counts_lv3_counts[ , -1], 2, function(x) x / gene_counts_lv3_counts[ , 1])
+gene_counts_lv3_normalized = as.data.frame(t(gene_counts_lv3_normalized))
+
+#聚类为lv2等级表
+row_group = unique(pgpg_levels[,c("Lv3","Lv2")])
+row_group = row_group[row_group$Lv3 %in% rownames(gene_counts_lv3_normalized),]
+gene_counts_lv2_normalized = merge_datafame(gene_counts_lv3_normalized,row_group = row_group,row_method = "sum")
+
+prevalence_pgpg_lv3 = merge(taxonomy_16s_extended[ ,c("taxid","prevalence_s")],t(gene_counts_lv3_normalized),by.x = "taxid",by.y = "row.names")
+prevalence_pgpg_lv4 = merge(taxonomy_16s_extended[ ,c("taxid","prevalence_s")],t(gene_counts_lv4_normalized),by.x = "taxid",by.y = "row.names")
+prevalence_pgpg_lv2 = merge(taxonomy_16s_extended[ ,c("taxid","prevalence_s")],t(gene_counts_lv2_normalized),by.x = "taxid",by.y = "row.names")
+cor_test_lv2 = cul_cor_df(prevalence_pgpg_lv2,"prevalence_s")
+cor_test_lv3 = cul_cor_df(prevalence_pgpg_lv3,"prevalence_s")
+cor_test_lv4 = cul_cor_df(prevalence_pgpg_lv4,"prevalence_s")
+
+pgpg_levels_lv3_lv2 = unique(pgpg_levels[ ,c("Lv3","Lv2")])
+sig_lv3_df = cor_test_lv3[cor_test_lv3$spearman_p<0.05,]
+sig_lv3_df = rownames_to_column(sig_lv3_df,"Lv3")
+sig_lv3_df$sig <- sapply(sig_lv3_df$spearman_p, ifsig)
+sig_lv3_df = merge(sig_lv3_df,pgpg_levels_lv3_lv2,by = "Lv3",all.x = TRUE)
+write.table(sig_lv3_df,file = "result/Trait_shifts/Table_s4_pgpg_sig_lv3.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+```
