@@ -1,0 +1,3421 @@
+---
+title: "analysis_pipeline"
+author: "Zilong Wang"
+date: "2026-08-08"
+output:
+  pdf_document: default
+  html_document: default
+---
+#代码编写规范
+#每个功能块使用rmd中的代码块进行封装，每个块的工作量应该适中，不宜在一个代码块中放置过多的内容
+#常用的功能应该封装为函数方便调用，工具函数放在Tools.R文件夹中，使用source加载
+#运行时长较久的步骤应该添加精度条，例如巨大的循环等，方便观察运行进度
+#不必局限于r语言，有一些复杂的任务可以考虑使用Python、shell等脚本实现
+#尽量在本地完成任务，如果遇到本地难以完成的任务可以将任务和代码封装到临时文件夹中上传到服务器进行运行，运行后仅将结果文件同步到本地，在本地脚本也要生成镜像的代码（假装是在本地运行出来的）
+
+
+#前情提要：
+#之前已经完成了跨区的合并，使用Python脚本对数据进行了初步清洗
+#接下来我要对数据进行标准化，数据标准化的方法如下
+#首先对丰度数据进行CSS标准化标准化
+#在CSS标准化的基础上将丰度表聚合到不同层级的丰度表（将同Phylum、Class、Order、Family，Genus的ASV的丰度进行合并）
+#对于映射到Silva和Unite参考序列的部分需要单独挑选出来，制作为0-1矩阵，这些ASV具有跨研究比对的资格，将利用这个部分的数据来计算微生物通才和专才
+
+
+
+# 接下来的分析我要揭示什么科学问题
+# 首先要做一些样本展示图或表来体现本研究的数据来源和数据规模之大
+# ①不同植物的种子微生物多样性和群落结构有什么差别（比较alpha和β多样性，alpha多样性基于region数据计算，β多样性使用Genus层级的丰度表来计算）
+# ②什么因素主导种子微生物群落的组装（当前的影响因素主要包括1、种子微生物提取方式不同2、测序区段不同3、种子来源地不同，期望通过一些方法证明宿主的种类是最主要的因素）
+# ③宿主植物遗传进化距离是否和种子微生物群落结构有关（对属级别微生物丰度表使用无监督聚类的方式对样本进行聚类，然后分析这个聚类结果与宿主进化距离的关系）
+# ④那些微生物在植物中广泛存在且占据主导作用（使用通才和专才的理论来进行分析和论述）
+# ⑤决定微生物有能力成为通才、专才（将全长序列映射到基因组序列然后分析）
+
+# 0. 环境配置：加载工具函数、定义输入输出路径
+```{r setup}
+# 加载公共工具函数（css_normalize 等）与所需包
+library(metagenomeSeq)
+library(data.table)
+library(ggplot2)
+source("scripts/R/Tools.R")
+
+# 工作目录约定：Analysis_pipeline.Rmd 所在目录（Downstream_analysis/）
+if (!file.exists("scripts/R/Tools.R")) {
+    stop("未找到 scripts/R/Tools.R，请确认工作目录为 Downstream_analysis/（Rmd 所在目录）")
+}
+
+# 输入：样本质控过滤后的合并丰度表（filtered_merge/，pipeline 步骤 02 输出）
+INPUT_CSS_16S <- "filtered_merge/16S/Merged_16S_table_filtered.txt"
+INPUT_CSS_ITS <- "filtered_merge/ITS/Merged_ITS_table_filtered.txt"
+
+# 输出：CSS 标准化后的丰度表（standard_merge/，与 pipeline.sh 全局配置一致）
+OUT_CSS_16S <- "standard_merge/css_16s_asvtab.txt"
+OUT_CSS_ITS <- "standard_merge/css_its_asvtab.txt"
+NF_CSS_16S  <- "standard_merge/css_16s_normFactors.txt"
+NF_CSS_ITS  <- "standard_merge/css_its_normFactors.txt"
+```
+
+# 1. 对合并数据样本标准化（CSS）
+# 方法：metagenomeSeq cumNorm，分位参数 p 用 cumNormStatFast 自动选择；
+#       MRcounts(norm = TRUE, log = FALSE)，即标准化后的 counts（非对数）。
+#       CSS 要求原始整数计数，函数内已做校验。
+
+# 1.1 16S 合并数据（70,275 ASV x 6,456 样本，规模较大，耗时较长）
+```{r css-16s}
+t16s <- system.time(
+    css_16s <- css_normalize(abund_path       = INPUT_CSS_16S,
+                             out_path         = OUT_CSS_16S,
+                             norm_factor_path = NF_CSS_16S)
+)
+cat(sprintf("16S CSS 标准化完成：%d ASV x %d 样本，耗时 %.1f min\n",
+            nrow(css_16s), ncol(css_16s), t16s[["elapsed"]] / 60))
+```
+
+# 1.2 ITS 合并数据（25,971 ASV x 2,382 样本）
+```{r css-its}
+t_its <- system.time(
+    css_its <- css_normalize(abund_path       = INPUT_CSS_ITS,
+                             out_path         = OUT_CSS_ITS,
+                             norm_factor_path = NF_CSS_ITS)
+)
+cat(sprintf("ITS CSS 标准化完成：%d ASV x %d 样本，耗时 %.1f min\n",
+            nrow(css_its), ncol(css_its), t_its[["elapsed"]] / 60))
+```
+
+# 2. 分区段数据 CSS 标准化（filtered_region → standard_region）
+# 6 个区段逐段执行，逻辑与合并数据完全相同（css_normalize，p 自动选择）。
+# 输入：filtered_region/<区段>/<区段>_merged_asvtab_filtered.txt（pipeline 步骤 03 输出）
+# 输出：standard_region/<区段>/css_<区段>_asvtab.txt + css_<区段>_normFactors.txt
+```{r css-region}
+region_cfg <- data.frame(
+    region = c("ITS1", "ITS2", "V3_V4", "V4", "V5_V6", "V5_V7"),
+    stringsAsFactors = FALSE
+)
+# 目录统一小写区段名（与合并数据 css_16s/css_its 风格一致）
+region_cfg$dir   <- tolower(region_cfg$region)
+region_cfg$abund <- file.path("filtered_region", region_cfg$region,
+                              paste0(region_cfg$region, "_merged_asvtab_filtered.txt"))
+region_cfg$out   <- file.path("standard_region", region_cfg$dir,
+                              paste0("css_", region_cfg$dir, "_asvtab.txt"))
+region_cfg$nf    <- file.path("standard_region", region_cfg$dir,
+                              paste0("css_", region_cfg$dir, "_normFactors.txt"))
+
+css_region <- list()
+for (i in seq_len(nrow(region_cfg))) {
+    message(sprintf("\n[%d/%d] 开始: %s", i, nrow(region_cfg), region_cfg$region[i]))
+    t_i <- system.time(
+        css_region[[region_cfg$region[i]]] <- css_normalize(
+            abund_path       = region_cfg$abund[i],
+            out_path         = region_cfg$out[i],
+            norm_factor_path = region_cfg$nf[i]
+        )
+    )
+    n_samp <- ncol(css_region[[region_cfg$region[i]]]) - 1   # 去掉首列 ASV_ID
+    message(sprintf("[%d/%d] %s 完成: %d ASV x %d 样本, 耗时 %.1f min",
+                    i, nrow(region_cfg), region_cfg$region[i],
+                    nrow(css_region[[region_cfg$region[i]]]), n_samp,
+                    t_i[["elapsed"]] / 60))
+}
+```
+
+# 3. 将 CSS 标准化丰度表聚合到各分类层级（Phylum/Class/Order/Family/Genus）
+# 方法：在 CSS 标准化的基础上，将同一层级内所有 ASV 的标准化丰度求和
+#       （merge_datafame, row_method = "sum"）。
+# 输入：standard_merge/css_16s_asvtab.txt、css_its_asvtab.txt（CSS 已完成）
+#       对应 taxonomy 取自 filtered_merge/<16S|ITS>/Merged_*_taxonomy_filtered.txt
+# 输出：standard_merge/<level>_16s_asvtab.txt、<level>_its_asvtab.txt
+#       （首列 = 该层级类群名，如 genus_16s_asvtab.txt 首列为 Genus）
+# 说明：仅合并数据（16S/ITS）做聚合；分区段（standard_region）按需可复用同一函数。
+
+# 3.1 16S 合并数据（70,275 ASV x 6,456 样本，逐层级聚合）
+```{r taxa-16s}
+taxa_16s <- aggregate_taxa_levels(
+    css_path   = OUT_CSS_16S,
+    tax_path   = "filtered_merge/16S/Merged_16S_taxonomy_filtered.txt",
+    out_dir    = "standard_merge",
+    dataset    = "16s",
+    levels     = c("Phylum", "Class", "Order", "Family", "Genus"),
+    row_method = "sum"
+)
+```
+
+# 3.2 ITS 合并数据（25,971 ASV x 2,382 样本）
+```{r taxa-its}
+taxa_its <- aggregate_taxa_levels(
+    css_path   = OUT_CSS_ITS,
+    tax_path   = "filtered_merge/ITS/Merged_ITS_taxonomy_filtered.txt",
+    out_dir    = "standard_merge",
+    dataset    = "its",
+    levels     = c("Phylum", "Class", "Order", "Family", "Genus"),
+    row_method = "sum"
+)
+```
+
+# 4. 样本名标准化（恢复 metadata 命名约定）
+# 原因：css_normalize 会从 filtered 表复制样本名（旧命名），聚合表亦继承之，
+#       CSS 重跑后需重新执行本函数恢复 metadata 命名。
+# 规则："-" → "."；数字开头前缀 "X"（例 0F3SS -> X0F3SS、16S-01-a-A02 -> X16S.01.a.A02）。
+# 作用范围：standard_merge/ 与 standard_region/ 下全部 CSS / 聚合 / normFactors 文件
+#           （跳过 metadata* 文件）。幂等，可重复运行。
+# 镜像脚本：scripts/python/rename_standard_samples.py（独立运行版本，二者保持同步）
+
+# 4.1 执行命名标准化并校验（Merged CSS 样本名集合与 metadata 完全一致）
+```{r sample-rename}
+res_rename <- standardize_sample_names()
+
+# 校验：Merged CSS 样本名集合与 metadata 完全一致（区段表为子集，不在此校验）
+m16s_names <- fread("standard_merge/metadata_16S.txt", select = "SampleID")$SampleID
+mits_names <- fread("standard_merge/metadata_ITS.txt", select = "SampleID")$SampleID
+css16s_nm  <- names(fread("standard_merge/css_16s_asvtab.txt"))[-1]
+cssits_nm  <- names(fread("standard_merge/css_its_asvtab.txt"))[-1]
+stopifnot(setequal(css16s_nm, m16s_names), setequal(cssits_nm, mits_names))
+cat(sprintf("  命名标准化校验通过：16S CSS %d 样本、ITS CSS %d 样本与 metadata 完全一致\n",
+            length(css16s_nm), length(cssits_nm)))
+```
+
+# 5. 丰度-样本分布图（门/纲/目/科/属 × 16S/ITS）
+# 目的：展示各分类层级类群相对丰度在样本间的分布，评估数据分辨率与未分类占比的影响。
+# 横轴 = 类群相对丰度占比(%)（每样本内 colSums 归一化 ×100）；
+# 纵轴 = 拥有该丰度的「类群×样本」观测数(log10)。
+# 数据：standard_merge/<level>_<16s|its>_asvtab.txt（第 3 节聚合结果）
+# 输出：figures/abundance_sample_dist_{linear,log}.png/.pdf + 分箱数据 abundance_sample_dist_data.txt
+# 说明：仅统计丰度>0 的观测（0 = 该样本中无此类群）；log 轴剔除 <0.001% 的超稀有观测。
+
+# 5.1 计算相对丰度分箱统计（线性 0–100% 与 log10 0.001–100% 两套分箱）
+```{r abund-dist-data}
+dir.create("figures", showWarnings = FALSE)
+
+# 固定 facet 顺序：左→右 门纲目科属；上→下 16S/ITS
+LEVELS   <- c("phylum", "class", "order", "family", "genus")
+LV_LABEL <- c(phylum = "Phylum", class = "Class", order = "Order",
+              family = "Family", genus = "Genus")
+DATS     <- c("16s", "its")
+DS_LABEL <- c(`16s` = "16S", `its` = "ITS")
+
+lin_breaks <- seq(0, 100, by = 1)                            # 线性分箱
+log_breaks <- 10^seq(log10(0.001), log10(100), length.out = 41)  # log10 分箱
+
+abund_hist <- list()
+for (ds in DATS) {
+    for (lv in LEVELS) {
+        tab <- fread(file.path("standard_merge", sprintf("%s_%s_asvtab.txt", lv, ds)))
+        m   <- as.matrix(tab[, -1, with = FALSE])
+        m   <- sweep(m, 2, colSums(m), "/") * 100            # 相对丰度 %
+        vals <- as.numeric(m); rm(m); invisible(gc())
+        vals <- vals[vals > 0 & is.finite(vals)]             # 0 = 样本中无此类群，剔除
+
+        h_lin <- hist(vals, breaks = lin_breaks, plot = FALSE)
+        v_log <- vals[vals >= 0.001]                         # log 轴剔除 <0.001% 观测
+        h_log <- hist(v_log, breaks = log_breaks, plot = FALSE)
+
+        abund_hist[[paste(ds, lv, "lin")]] <- data.table(
+            dataset = ds, level = lv, scale = "linear",
+            xmin = head(lin_breaks, -1), xmax = tail(lin_breaks, -1),
+            count = h_lin$counts)
+        abund_hist[[paste(ds, lv, "log")]] <- data.table(
+            dataset = ds, level = lv, scale = "log",
+            xmin = head(log_breaks, -1), xmax = tail(log_breaks, -1),
+            count = h_log$counts)
+    }
+}
+ABUND_DIST <- rbindlist(abund_hist)
+ABUND_DIST[, level   := factor(level,   levels = LEVELS)]
+ABUND_DIST[, dataset := factor(dataset, levels = DATS)]
+fwrite(ABUND_DIST, "figures/abundance_sample_dist_data.txt", sep = "\t")
+
+# 概要：各层级观测的丰度分段占比（<1% / 1–10% / 10–50% / >50%）
+abund_summ <- ABUND_DIST[scale == "linear", .(
+    n_obs    = sum(count),
+    pct_lt1   = 100 * sum(count[xmax <= 1]) / sum(count),
+    pct_1_10  = 100 * sum(count[xmin >= 1  & xmax <= 10]) / sum(count),
+    pct_10_50 = 100 * sum(count[xmin >= 10 & xmax <= 50]) / sum(count),
+    pct_gt50  = 100 * sum(count[xmin > 50]) / sum(count)),
+    by = .(dataset, level)]
+print(abund_summ)
+```
+
+# 5.2 绘图（线性横轴 0–100%）
+```{r abund-dist-linear, fig.width = 12, fig.height = 6, out.width = "100%"}
+p_lin <- ggplot(ABUND_DIST[scale == "linear" & count > 0],
+                aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = count)) +
+    geom_rect(fill = "#2c6fbb", colour = NA) +
+    facet_grid(dataset ~ level, scales = "free_y",
+               labeller = labeller(level = LV_LABEL, dataset = DS_LABEL)) +
+    scale_y_log10() +
+    labs(x = "Taxon relative abundance (%)",
+         y = "Observations (taxon x sample, log10)",
+         title = "Abundance-sample distribution (linear x-axis, 0-100%)") +
+    theme_bw(base_size = 11) +
+    theme(panel.grid.minor = element_blank(), plot.title = element_text(hjust = 0.5))
+ggsave("figures/abundance_sample_dist_linear.png", p_lin, width = 14, height = 7, dpi = 150)
+ggsave("figures/abundance_sample_dist_linear.pdf", p_lin, width = 14, height = 7)
+print(p_lin)
+```
+
+# 5.3 绘图（log10 横轴 0.001–100%，推荐查看）
+```{r abund-dist-log, fig.width = 12, fig.height = 6, out.width = "100%"}
+p_log <- ggplot(ABUND_DIST[scale == "log" & count > 0],
+                aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = count)) +
+    geom_rect(fill = "#a0492c", colour = NA) +
+    facet_grid(dataset ~ level, scales = "free_y",
+               labeller = labeller(level = LV_LABEL, dataset = DS_LABEL)) +
+    scale_x_log10(breaks = c(0.001, 0.01, 0.1, 1, 10, 100),
+                  labels = c("0.001", "0.01", "0.1", "1", "10", "100")) +
+    scale_y_log10() +
+    labs(x = "Taxon relative abundance (%), log10 axis",
+         y = "Observations (taxon x sample, log10)",
+         title = "Abundance-sample distribution (log10 x-axis, 0.001-100%)") +
+    theme_bw(base_size = 11) +
+    theme(panel.grid.minor = element_blank(), plot.title = element_text(hjust = 0.5))
+ggsave("figures/abundance_sample_dist_log.png", p_log, width = 14, height = 7, dpi = 150)
+ggsave("figures/abundance_sample_dist_log.pdf", p_log, width = 14, height = 7)
+print(p_log)
+```
+
+# 6. 数据集展示（Dataset Overview）
+# 目的：对 seed microbiome meta 分析的数据集进行系统展示——样本来源、宿主、
+#       国家/地区分布等，输出 result/dataset_overview/{result_data, result_figure, result_table}。
+# 数据源：standard_merge/metadata_16S.txt、metadata_ITS.txt（权威样本清单，命名即 metadata 约定）。
+# 注意：此处样本计数基于 metadata（全部样本），与质控过滤后的 CSS 表样本数不同
+#       （如 16S V4 metadata 2,534 vs CSS 表 2,450）。
+# 镜像脚本：scripts/R/dataset_overview.R（独立运行版本，二者需保持同步）。
+
+# 6.1 配置：目录、配色、常量与通用保存函数（与 dataset_overview.R 一致）
+```{r dsov-setup}
+library(cowplot)  # plot_grid（dplyr 已在第 3 节由聚合函数加载）
+
+dsov <- list(
+    data  = file.path("result", "dataset_overview", "result_data"),
+    fig   = file.path("result", "dataset_overview", "result_figure"),
+    tab   = file.path("result", "dataset_overview", "result_table")
+)
+dsov$panel <- file.path(dsov$fig, "panels")
+for (d in unique(unlist(dsov))) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+# 配色（用户提供，与 dataset_overview.R 一致）
+PAL1 <- c("#3A5A40", "#F2CC8F", "#81B29A", "#3D405B", "#F4A261",
+          "#099396", "#E7D6C2", "#547FB6", "#C5D8E7", "#BF6173",
+          "#E07A5F", "#90DBF4", "#641E16", "#A7C957", "#D35400")
+PAL2 <- c("#855B67", "#B6BCCA", "#C1B5BF", "#FDE0E4",
+          "#78A495", "#8A926B", "#5D6C57", "#6E736D", "#E4E2C9",
+          "#CFE1D3", "#995B70", "#846992", "#D4C0C2", "#F7E09B",
+          "#099396", "#E7D6C2", "#547FB6", "#C5D8E7", "#BF6173",
+          "#3A5A40", "#90DBF4", "#641E16", "#BFEFEE", "#D35400",
+          "#1D3557", "#F1C40F", "#5B2C6F", "#A7C957", "#E63946",
+          "#355070", "#F4A261", "#1E5959", "#CB997E",
+          "#2A9D8F", "#FFE8D6", "#6D597A", "#F9C74F", "#2E4053",
+          "#A8DADC", "#BA4A00", "#7DCEA0", "#424949", "#E5989B",
+          "#E07A5F", "#F2CC8F", "#81B29A", "#3D405B", "#F4A261",
+          "#E76F51", "#2A9D8F", "#264653", "#F9C74F", "#A8DADC",
+          "#E63946", "#F1FAEE", "#457B9D", "#E0A458", "#6D597A",
+          "#B5E8D5", "#FFBF69", "#2EC4B6", "#1D3557", "#F6BD60",
+          "#8AC6C3", "#E56B6F", "#4A6FA5", "#F5E8C7", "#233D4D")
+
+REG_ORDER <- c("V3_V4", "V4", "V5_V6", "V5_V7", "ITS1", "ITS2")
+SRC_ORDER <- c("S1-58 Collected", "S59 Simonin2022", "S60 Lab(52spp)")
+SRC_COL   <- setNames(PAL1[c(1, 6, 14)], SRC_ORDER)  # 来源配色
+
+# 统一保存 PDF + JPG（JPG 供预览，PDF 供拼接）
+save_fig <- function(p, stem, w = 8, h = 6) {
+    ggplot2::ggsave(file.path(dsov$fig, paste0(stem, ".pdf")), p,
+                    width = w, height = h, device = "pdf", dpi = 300)
+    ggplot2::ggsave(file.path(dsov$fig, paste0(stem, ".jpg")), p,
+                    width = w, height = h, device = "jpeg", dpi = 300, quality = 92)
+    message("  [fig] ", stem, ".pdf / .jpg")
+}
+TH <- theme_minimal(base_size = 11) +
+    theme(panel.grid.minor = element_blank())
+```
+
+# 6.2 读取并合并 metadata：来源/区段/样本类型/国名归一化
+```{r dsov-metadata}
+m16  <- fread(file.path("standard_merge", "metadata_16S.txt"))
+mits <- fread(file.path("standard_merge", "metadata_ITS.txt"))
+
+md <- rbind(
+    m16[, .(SampleID, Genus, species, Country, Cite, extract,
+            Region, bio_project, dataset = "16S")],
+    mits[, .(SampleID, Genus, species, Country, Cite, extract,
+             Region, bio_project, dataset = "ITS")]
+)
+md[, region := factor(Region, levels = REG_ORDER)]
+
+# 三来源分类（S1-58 收集 / S59 Simonin2022 / S60 实验室自测 52 种植物）
+md[, source := fifelse(Cite == "S59", SRC_ORDER[2],
+                fifelse(Cite == "S60", SRC_ORDER[3], SRC_ORDER[1]))]
+md[, source := factor(source, levels = SRC_ORDER)]
+
+# 国名归一化（metadata 拼写 -> Natural Earth 标准国名，与 map_sample_distribution.py 的 SYNONYMS 一致）
+CNTRY_FIX <- c("Cote d Ivoire"        = "Côte d'Ivoire",
+               "Italia"               = "Italy",
+               "Korea"                = "South Korea",
+               "USA"                  = "United States of America",
+               "United States"        = "United States of America",
+               "Czech Republic"       = "Czechia",
+               "England"              = "United Kingdom",
+               "Republic of the Congo" = "Congo",
+               "Democratic Republic of the Congo" = "Dem. Rep. Congo")
+md[, country_raw := Country]
+for (nm in names(CNTRY_FIX)) md[Country == nm, Country := CNTRY_FIX[[nm]]]
+# 空/缺失国名 -> unknown（metadata 已清理，此处兜底，防止上游回传空值）
+md[is.na(Country) | Country == "", Country := "unknown"]
+
+# 样本类型（extract：S/Seed -> Seed；P/p -> Tissue；Germinating）
+md[, extract_std := fifelse(grepl("^s|seed", extract, ignore.case = TRUE), "Seed",
+                    fifelse(grepl("^p|tissue|plant", extract, ignore.case = TRUE), "Tissue",
+                    fifelse(grepl("germ", extract, ignore.case = TRUE), "Germinating", "Other")))]
+
+cat(sprintf("  合并样本: 16S %d + ITS %d = %d\n",
+            md[dataset == "16S", .N], md[dataset == "ITS", .N], md[, .N]))
+```
+
+# 6.3 中间数据输出（result_data）：国名检查表、地图计数、合并 metadata
+```{r dsov-data}
+# 部分样本没有精确国家（Country = "unknown"），不参与国家维度展示，直接排除
+md_geo <- md[!is.na(Country) & !Country %in% c("", "unknown")]
+message(sprintf("  [data] 国家缺失样本 %d 个已排除（unknown，不出图）",
+                md[, .N] - md_geo[, .N]))
+
+cn <- md_geo[, .(n_16s = sum(dataset == "16S"), n_its = sum(dataset == "ITS"),
+                 total = .N), by = .(country_raw, Country)][order(-total)]
+setnames(cn, c("country_raw", "Country"), c("original_country", "mapped_country"))
+fwrite(cn, file.path(dsov$data, "country_name_check.tsv"), sep = "\t")
+message("  [data] country_name_check.tsv")
+
+cc <- md_geo[, .(n_16s = sum(dataset == "16S"), n_its = sum(dataset == "ITS")),
+             by = Country][, total := n_16s + n_its][order(-total)]
+fwrite(cc, file.path(dsov$data, "country_counts.tsv"), sep = "\t")
+message("  [data] country_counts.tsv（Fig1 地图输入）")
+
+save(md, file = file.path(dsov$data, "metadata_combined.RData"))
+message("  [data] metadata_combined.RData")
+```
+
+# 6.4 表格 Table1-6（样本规模 / 来源 / 区段×国家 / 宿主属 / 宿主种 / 研究清单）
+```{r dsov-tables}
+row_sum <- function(d, dataset_label, region_label) {
+    data.table(
+        dataset   = dataset_label,
+        region    = region_label,
+        samples   = nrow(d),
+        studies   = uniqueN(d$Cite),
+        countries = uniqueN(d[Country != "unknown"]$Country),
+        host_genera  = uniqueN(d$Genus),
+        host_species = uniqueN(d$species),
+        seed_samples    = sum(d$extract_std == "Seed"),
+        tissue_samples  = sum(d$extract_std == "Tissue"),
+        other_samples   = sum(!d$extract_std %in% c("Seed", "Tissue")),
+        seed_pct = round(100 * sum(d$extract_std == "Seed") / nrow(d), 1)
+    )
+}
+regs_16s <- REG_ORDER[1:4]; regs_its <- REG_ORDER[5:6]
+t1 <- rbindlist(c(
+    list(row_sum(md[dataset == "16S"], "16S", "All")),
+    lapply(regs_16s, function(r) row_sum(md[dataset == "16S" & Region == r], "16S", r)),
+    list(row_sum(md[dataset == "ITS"], "ITS", "All")),
+    lapply(regs_its, function(r) row_sum(md[dataset == "ITS" & Region == r], "ITS", r)),
+    list(row_sum(md, "ALL", "All"))
+))
+fwrite(t1, file.path(dsov$tab, "Table1_data_overview.tsv"), sep = "\t")
+print(t1)
+
+t2 <- rbindlist(lapply(c("16S", "ITS"), function(ds) {
+    rbindlist(lapply(SRC_ORDER, function(s) {
+        row_sum(md[dataset == ds & source == s], ds, s)
+    }))
+}))
+setnames(t2, "region", "source")
+fwrite(t2, file.path(dsov$tab, "Table2_source_summary.tsv"), sep = "\t")
+
+t3 <- dcast(md_geo, Country ~ Region, fun.aggregate = length, value.var = "SampleID")
+for (r in REG_ORDER) if (!r %in% names(t3)) t3[, (r) := 0L]
+setcolorder(t3, c("Country", REG_ORDER))
+t3[, (REG_ORDER) := lapply(.SD, function(x) fifelse(is.na(x), 0L, x)),
+   .SDcols = REG_ORDER]
+t3[, n_16s := rowSums(.SD), .SDcols = regs_16s]
+t3[, n_its := rowSums(.SD), .SDcols = regs_its]
+t3[, total := n_16s + n_its]
+t3 <- t3[order(-total)]
+tot_row <- data.table(t(apply(t3[, -1, with = FALSE], 2, sum)))
+setnames(tot_row, names(t3)[-1])
+tot_row[, Country := "TOTAL"]
+t3 <- rbindlist(list(t3, tot_row), use.names = TRUE, fill = TRUE)
+fwrite(t3, file.path(dsov$tab, "Table3_region_by_country.tsv"), sep = "\t")
+
+t4 <- md[, .(samples = .N), by = .(dataset, Genus)][
+    , pct := round(100 * samples / sum(samples), 2), by = dataset][
+    order(dataset, -samples)]
+setnames(t4, "Genus", "host_genus")
+fwrite(t4, file.path(dsov$tab, "Table4_host_genus.tsv"), sep = "\t")
+
+t5 <- md[, .(samples = .N), by = .(dataset, species)][
+    , pct := round(100 * samples / sum(samples), 2), by = dataset][
+    order(dataset, -samples)]
+setnames(t5, "species", "host_species")
+fwrite(t5, file.path(dsov$tab, "Table5_host_species.tsv"), sep = "\t")
+
+gt <- md[, .N, by = .(Cite, Genus)][order(Cite, -N)][
+    , .(top_genus = Genus[1], top_genus_n = N[1]), by = Cite]
+t6 <- md[, .(n_16s = sum(dataset == "16S"),
+             n_its = sum(dataset == "ITS"),
+             total = .N,
+             n_countries = uniqueN(Country[Country != "unknown"]),
+             region_16s = paste(unique(Region[dataset == "16S"]), collapse = ","),
+             region_its = paste(unique(Region[dataset == "ITS"]), collapse = ","),
+             bio_projects = paste(unique(bio_project), collapse = ";"),
+             seed_pct = round(100 * sum(extract_std == "Seed") / .N, 1)),
+         by = Cite][gt, on = "Cite"]
+t6[, source := fifelse(Cite == "S59", SRC_ORDER[2],
+                fifelse(Cite == "S60", SRC_ORDER[3], SRC_ORDER[1]))]
+setcolorder(t6, c("Cite", "source", "n_16s", "n_its", "total",
+                  "region_16s", "region_its", "n_countries",
+                  "top_genus", "top_genus_n", "seed_pct", "bio_projects"))
+t6 <- t6[order(-total)]
+fwrite(t6, file.path(dsov$tab, "Table6_study_list.tsv"), sep = "\t")
+message("  [tab] Table1-6 已写出 result/dataset_overview/result_table/")
+```
+
+# 6.5 主图 Fig1：样本全球分布热图（Python + geopandas 外部进程）
+```{r dsov-fig1-map}
+# 依赖 geopandas/pandas/numpy/matplotlib（本地已安装）。
+# 国家计数来自 6.3 节 country_counts.tsv；未识别国名写入 *_unmatched_countries.txt。
+# Fig1_global_map = 16S/ITS 双面板；Fig1_2 = 16S+ITS 合计单面板（--panel combined）。
+inp_map <- file.path(dsov$data, "country_counts.tsv")
+shp_map <- "scripts/python/ne_110m_admin_0_countries/ne_110m_admin_0_countries.shp"
+if (file.exists(inp_map)) {
+    map_cmd1 <- sprintf(
+        "python scripts/python/map_sample_distribution.py --input %s --shapefile %s --outdir %s --prefix Fig1_global_map",
+        inp_map, shp_map, dsov$fig)
+    system(map_cmd1)
+    map_cmd2 <- sprintf(
+        "python scripts/python/map_sample_distribution.py --input %s --shapefile %s --outdir %s --prefix Fig1_2 --panel combined",
+        inp_map, shp_map, dsov$fig)
+    system(map_cmd2)
+} else {
+    warning("country_counts.tsv 不存在，跳过 Fig1 地图生成")
+}
+```
+
+# 6.6 主图 Fig2：数据集构成总览（地图+国家饼图 / 来源×区段 / 样本类型 / 宿主属 Top15）
+```{r dsov-fig2}
+library(jpeg)  # 读入 Fig1_2 地图 JPG 嵌入 Fig2 顶部
+
+# 面板 (a)：Fig1_2 全球分布地图热图（读入 6.5 节生成结果）
+fig12_path <- file.path(dsov$fig, "Fig1_2.jpg")
+if (file.exists(fig12_path)) {
+    map_ras <- jpeg::readJPEG(fig12_path)
+    pmap <- ggdraw(grid::rasterGrob(map_ras, interpolate = TRUE)) +
+        draw_label("(a)", x = 0.02, y = 0.97, hjust = 0, vjust = 1,
+                   size = 16, fontface = "bold")
+} else {
+    message("  [warn] Fig1_2.jpg 不存在，Fig2 顶部以占位符代替")
+    pmap <- ggplot() +
+        annotate("text", x = 0.5, y = 0.5, size = 6, fontface = "bold",
+                 label = "Fig1_2 map not found\nrun map_sample_distribution.py --panel combined") +
+        labs(title = "(a) Global distribution of samples (16S + ITS)") +
+        theme_void() + theme(plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+# 面板 (b)：Top10 国家 + Other 饼图（SFig4 内容改造，unknown 排除）
+# 用 Tools.R 的 draw_pie_chart：传入 dataframe + 类别列名 data_col，函数内部
+# count→百分比→TopN+other 合并（limit_n=10，第 11 片 "other" 自动置 #eeeeee）。
+p_ctry <- draw_pie_chart(
+    as.data.frame(md[Country != "unknown"]),
+    data_col = "Country",
+    label = FALSE, pre = TRUE, legend_t = "Country",
+    limit_n = 10, color_list = PAL2
+) + labs(title = "(b) Top 10 countries by samples (others combined)")
+
+# 面板 (c)：来源 × 区段 样本量堆叠条图
+pa_dat <- md[, .N, by = .(source, region, dataset)]
+pa <- ggplot(pa_dat, aes(source, N, fill = region)) +
+    geom_col(width = 0.72, colour = "white", linewidth = 0.3) +
+    geom_text(aes(label = N), position = position_stack(vjust = 0.5),
+              size = 2.6, colour = "white") +
+    facet_wrap(~dataset, scales = "free_y") +
+    scale_fill_manual(values = setNames(PAL1[1:6], REG_ORDER), name = "Region") +
+    labs(x = NULL, y = "Number of samples",
+         title = "(c) Samples by source and region") +
+    TH + theme(axis.text.x = element_text(angle = 0),
+               strip.text = element_text(size = 12))
+
+# 面板 (d)：样本类型（种子/组织）饼图
+pb <- draw_pie_chart(as.data.frame(md), data_col = "extract_std",
+                     label = TRUE, pre = TRUE, legend_t = "Sample type",
+                     limit_n = 26, color_list = PAL2) +
+    labs(title = "(d) Sample type composition")
+
+# 面板 (e)/(f)：宿主属 Top15（每数据集）
+genus_top_plot <- function(ds, lbl) {
+    d <- head(md[dataset == ds, .N, by = Genus][order(-N)], 15)
+    d[, Genus := factor(Genus, levels = rev(Genus))]
+    ggplot(d, aes(Genus, N, fill = Genus)) +
+        geom_col(show.legend = FALSE, width = 0.7) +
+        coord_flip() +
+        geom_text(aes(label = N), hjust = -0.1, size = 3) +
+        scale_fill_manual(values = rep(PAL2, length.out = nrow(d))) +
+        labs(x = NULL, y = "Samples", title = paste0("(", lbl, ") Top 15 host genera (", ds, ")")) +
+        TH + theme(panel.grid.major.y = element_blank())
+}
+pc16  <- genus_top_plot("16S", "e")
+pcits <- genus_top_plot("ITS", "f")
+
+fig2 <- plot_grid(
+    plot_grid(pmap, p_ctry, nrow = 1, rel_widths = c(1.6, 1)),   # 顶部：地图 + 国家饼图
+    pa,
+    plot_grid(pb, pc16, pcits, nrow = 1, rel_widths = c(1, 1.1, 1.1)),
+    nrow = 3, rel_heights = c(1, 0.9, 1.05)
+)
+save_fig(fig2, "Fig2_dataset_overview", w = 16, h = 12.5)
+save_fig(p_ctry, file.path("panels", "Fig2_panel_b_country_pie"),    w = 6,  h = 5.2)
+save_fig(pa,     file.path("panels", "Fig2_panel_c_source_region"),  w = 9,  h = 4.2)
+save_fig(pb,     file.path("panels", "Fig2_panel_d_sample_type"),    w = 6,  h = 4.2)
+save_fig(pc16,   file.path("panels", "Fig2_panel_e_host_genus_16S"), w = 6,  h = 4.5)
+save_fig(pcits,  file.path("panels", "Fig2_panel_f_host_genus_ITS"), w = 6,  h = 4.5)
+print(fig2)
+```
+
+# 6.7 附图 SFig1-4：各研究样本量 / 宿主属×区段热图 / 宿主种 / 各国样本量
+```{r dsov-sfig}
+# SFig1 各研究样本量 Top30
+study_plot <- function(ds) {
+    d <- head(md[dataset == ds, .N, by = .(Cite, source)][order(-N)], 30)
+    d[, Cite := factor(Cite, levels = rev(Cite))]
+    ggplot(d, aes(Cite, N, fill = source)) +
+        geom_col(width = 0.72) + coord_flip() +
+        scale_fill_manual(values = SRC_COL, name = "Source") +
+        labs(x = NULL, y = "Samples", title = ds) +
+        TH + theme(panel.grid.major.y = element_blank())
+}
+sfig1 <- plot_grid(study_plot("16S"), study_plot("ITS"), nrow = 2,
+                   labels = "auto")
+save_fig(sfig1, "SFig1_study_samples", w = 10, h = 10)
+
+# SFig2 宿主属 × 区段 热图（Top15 属）
+topg <- head(md[, .N, by = Genus][order(-N)], 15)[, Genus]
+hm <- md[Genus %in% topg, .N, by = .(Genus, region)]
+hm[, Genus := factor(Genus, levels = rev(hm[, .(tot = sum(N)), by = Genus][
+    order(-tot), Genus]))]
+sfig2 <- ggplot(hm, aes(region, Genus, fill = log10(N + 1))) +
+    geom_tile(colour = "white", linewidth = 0.6) +
+    geom_text(aes(label = N), size = 3.4) +
+    scale_fill_gradient(low = "#F7F7F7", high = "#2A4019", name = "log10(n+1)") +
+    labs(x = NULL, y = NULL,
+         title = "Top 15 host genera across regions (sample counts)") +
+    TH + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+save_fig(sfig2, "SFig2_host_region_heatmap", w = 8, h = 6.5)
+
+# SFig3 宿主种 Top20
+species_plot <- function(ds) {
+    d <- head(md[dataset == ds, .N, by = species][order(-N)], 20)
+    d[, species := factor(species, levels = rev(species))]
+    ggplot(d, aes(species, N, fill = species)) +
+        geom_col(show.legend = FALSE, width = 0.7) +
+        coord_flip() +
+        geom_text(aes(label = N), hjust = -0.1, size = 2.8) +
+        scale_fill_manual(values = rep(PAL2, length.out = nrow(d))) +
+        labs(x = NULL, y = "Samples", title = ds) +
+        TH + theme(panel.grid.major.y = element_blank())
+}
+sfig3 <- plot_grid(species_plot("16S"), species_plot("ITS"), nrow = 2,
+                   labels = "auto")
+save_fig(sfig3, "SFig3_host_species_top20", w = 10, h = 11)
+
+# SFig4 各国样本量 Top30（unknown 排除，不出图）
+cc30 <- head(md[Country != "unknown", .N, by = Country][order(-N)], 30)
+cc30[, Country := factor(Country, levels = rev(Country))]
+sfig4 <- ggplot(cc30, aes(Country, N, fill = log10(N))) +
+    geom_col(width = 0.72) + coord_flip() +
+    scale_fill_gradient(low = "#A2CCAD", high = "#2A4019", name = "log10(n)") +
+    labs(x = NULL, y = "Number of samples",
+         title = "Top 30 countries by total samples (unknown excluded)") +
+    TH + theme(panel.grid.major.y = element_blank())
+save_fig(sfig4, "SFig4_country_samples", w = 8, h = 8)
+
+cat("\nDataset Overview 全部完成，输出至 result/dataset_overview/\n")
+```
+
+```{r dsov-sfig5, fig.width = 10, fig.height = 4.5, out.width = "100%"}
+# SFig5 可注释到属(Genus)的 ASV reads 占比分布（源数据：filtered_merge 16S/ITS 丰度表 + taxonomy）
+# 逻辑：挑出 Genus 已精确注释（非 Unassigned/空/NA）的 ASV，计算每个样本中
+#       这些 ASV 的 reads 占总 reads 的比例(%)，按样本绘制分布直方图。
+#       16S 与 ITS 各一张面板（纵轴为该占比区间下的样本个数）。
+FM_DIR <- "filtered_merge"   # Rmd 工作目录约定：Downstream_analysis/
+genus_frac <- function(ds) {
+    tax_f <- file.path(FM_DIR, ds, sprintf("Merged_%s_taxonomy_filtered.txt", ds))
+    tab_f <- file.path(FM_DIR, ds, sprintf("Merged_%s_table_filtered.txt", ds))
+    tax <- fread(tax_f, sep = "\t")
+    setnames(tax, 1, "ASV_ID")
+    genus_ok <- tax[!is.na(Genus) & Genus != "" & Genus != "Unassigned", ASV_ID]
+    message(sprintf("  [%s] taxonomy %d ASVs，Genus 已注释 %d (%.1f%%)",
+                    ds, nrow(tax), length(genus_ok),
+                    100 * length(genus_ok) / nrow(tax)))
+    tab <- fread(tab_f, sep = "\t", colClasses = list(character = 1))
+    setnames(tab, 1, "ASV_ID")
+    stopifnot(all(genus_ok %in% tab$ASV_ID))
+    m <- as.matrix(tab[, -1, with = FALSE])
+    tot <- colSums(m)                      # 每样本总 reads
+    gsum <- colSums(m[tab$ASV_ID %in% genus_ok, , drop = FALSE])  # 属注释 reads
+    pct <- ifelse(tot > 0, gsum / tot * 100, 0)
+    data.table(Sample = names(tot), dataset = ds, total_reads = tot,
+               genus_reads = gsum, genus_pct = round(pct, 4))
+}
+frac_16s <- genus_frac("16S")
+frac_its <- genus_frac("ITS")
+frac_all <- rbindlist(list(frac_16s, frac_its))
+fwrite(frac_all, file.path(dsov$data, "genus_annotation_fraction.tsv"), sep = "\t")
+message("  [data] genus_annotation_fraction.tsv（SFig5 源数据，样本级占比）")
+
+frac_plot <- function(d, col) {
+    ggplot(d, aes(genus_pct)) +
+        geom_histogram(breaks = seq(0, 100, 5), fill = col, colour = "white",
+                       linewidth = 0.2) +
+        scale_x_continuous(breaks = seq(0, 100, 20),
+                           expand = expansion(mult = c(0.005, 0.005))) +
+        coord_cartesian(xlim = c(0, 100)) +
+        labs(x = "Fraction of reads assigned to genus (%)",
+             y = "Number of samples",
+             title = d$dataset[1],
+             subtitle = sprintf("n = %d samples, median = %.1f%%",
+                                nrow(d), median(d$genus_pct))) +
+        TH + theme(plot.title = element_text(face = "bold"))
+}
+sfig5 <- plot_grid(frac_plot(frac_16s, "#3A5A40"), frac_plot(frac_its, "#D97B29"),
+                   nrow = 1, labels = "auto")
+save_fig(sfig5, "SFig5_genus_annotation_abundance", w = 10, h = 4.5)
+```
+
+
+#基于TimeTree5构建种水平进化树
+```{r}
+library(dplyr)
+library(stringr)
+dir.create("plant_tree")
+metadata_16s <- read.delim("standard_merge/metadata_16S.txt")
+metadata_16s[,"type"] = "16s"
+metadata_its <- read.delim("standard_merge/metadata_ITS.txt")
+metadata_its[,"type"] = "its"
+all_plant_tax = unique(rbind(metadata_16s[ ,c(2:9)],metadata_its[ ,c(2:9)]))
+all_plant = unique(all_plant_tax$timetree)
+#构建
+writeLines(all_plant,"plant_tree/species_all.txt")
+
+#在timetree5平台对species_all_16s.txt和species_all_its.txt进行注释
+if (file.exists("plant_tree/species_all.nwk")) {
+  message("找到目标文件，继续运行...")
+  library(ape)
+  species_all_tree = read.tree("plant_tree/species_all.nwk")
+  #修改叶节点标签
+  species_all_tree$tip.label <- all_plant_tax$species[match(species_all_tree$tip.label, all_plant_tax$timetree)]
+  write.tree(species_all_tree, file = "plant_tree/plant_species_tree_all.nwk")
+  #裁剪出16s_v4树
+  tree_16s_v4 <- keep.tip(species_all_tree, tip = unique(metadata_16s$species[metadata_16s$Region=="V4"]))
+  tree_16s_v5_v7 <- keep.tip(species_all_tree, tip = unique(metadata_16s$species[metadata_16s$Region=="V5_V7"]))
+  tree_16s_its1 <- keep.tip(species_all_tree, tip = unique(metadata_its$species[metadata_its$Region=="ITS1"]))
+  write.tree(tree_16s_v4, file = "plant_tree/plant_species_tree_v4.nwk")
+  write.tree(tree_16s_v5_v7, file = "plant_tree/plant_species_tree_v5_v7.nwk")
+  write.tree(tree_16s_its1, file = "plant_tree/plant_species_tree_its1.nwk")
+  
+  #从Species树中裁剪出一颗Genus树
+  #从每个Genus中挑选一个species
+  replace_vec_SP <- all_plant_tax[!duplicated(all_plant_tax[, "Genus"]), ]
+  plant_Genus_tree_all = keep.tip(species_all_tree, tip = replace_vec_SP$species)
+  plant_Genus_tree_all$tip.label <- replace_vec_SP$Genus[match(plant_Genus_tree_all$tip.label, replace_vec_SP$species)]
+  write.tree(plant_Genus_tree_all, file = "plant_tree/plant_Genus_tree_all.nwk")
+} else {
+  stop("请将species_all.txt文件在timetree5平台中注释，导出树文件到plant_tree文件夹")
+}
+```
+
+```{r}
+# 制作样本总结表
+library(dplyr)
+library(flextable)
+library(officer)
+
+# Assuming 'metadata' is your dataframe with the specified columns
+metadata_16s <- read.delim("standard_merge/metadata_16S.txt")
+metadata_16s[,"type"] = "16s"
+metadata_its <- read.delim("standard_merge/metadata_ITS.txt")
+metadata_its[,"type"] = "its"
+all_metadata <- bind_rows(metadata_16s,metadata_its)
+result <- all_metadata %>%
+  group_by(Order, Genus) %>%
+  summarize(
+    samples_16s = sum(`type` == "16s", na.rm = TRUE),
+    samples_its = sum(`type` == "its", na.rm = TRUE),
+    ratio_samples = paste(samples_16s, samples_its, sep = "/"),
+    studies_16s = n_distinct(Cite[`type` == "16s"]),
+    studies_its = n_distinct(Cite[`type` == "its"]),
+    ratio_studies = paste(studies_16s, studies_its, sep = "/"),
+    references = paste(unique(Cite), collapse = "; ")
+  ) %>%
+  ungroup() %>%
+  arrange(Order, Genus)
+
+plant_Genus_tree_all = read.tree("plant_tree/plant_Genus_tree_all.nwk")
+tree_label <- plant_Genus_tree_all$tip.label
+name_df = data.frame(index = c(1:length(tree_label)),
+                     Genus = tree_label)
+
+
+result = merge(name_df,result,by="Genus")
+result = result %>% arrange(index)
+write.table(result,file = "result/dataset_overview/result_table/sample_summary_table.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+colnames(result)
+ft <- flextable(result[ ,c("Genus","Order","ratio_samples","ratio_studies","references")])
+all_metadata <- rbind(metadata_16s, metadata_its)
+
+# Set column headers
+ft <- set_header_labels(ft,
+                        Order = "Order",
+                        Genus = "Genus",
+                        ratio_samples = "Samples 16S/ITS",
+                        ratio_studies = "Studies 16S/ITS",
+                        references = "References"
+)
+# Merge vertically identical Order cells
+ft <- merge_v(ft, j = "Order")
+# Add thin inner borders for all cells (corrected with officer::fp_border)
+ft <- border_inner(ft, border = officer::fp_border(width = 0.5))
+# Add outer borders
+ft <- border_outer(ft, border = officer::fp_border(width = 1))
+ft
+```
+
+# 7. Host_Seed_microbiota — 宿主与种子微生物组关系分析
+
+分析目的：探究宿主植物遗传发育（系统发育）与种子微生物多样性 / 群落结构的关系。
+
+**完整流程**（运行本节代码块即可产出 `result/Host_Seed_microbiota/` 下的全部结果）：
+
+| 环节 | 分析内容 | 输出 |
+|------|----------|------|
+| 7.1 | 环境与路径配置 | — |
+| 7.2 | 所有区段（6 个）的 α 与 β 多样性计算 | `rds/alpha_div_*.rds`、`rds/bray_dist_*.rds` |
+| 7.3 α | 两种 α 多样性（Shannon/Observed）的宿主系统发育信号 + 环形树图 + λ bootstrap 95% CI（加固）+ 分层柱状图（V4 / V5_V7 / ITS1） | `result_figure/alpha_diversity/`、`result_table/phylosig_results.csv`、`result_table/phylosig_lambda_ci.tsv` |
+| 7.4 β | 微生物矩阵 vs 宿主遗传发育矩阵（Mantel/MRM/dbRDA）+ T=0 网格搜索最佳聚类方法与 k + 聚类树 | `result_figure/beta_diversity/`、`result_figure/clustering/` |
+| 7.4.3 β | β 多样性因素分解：PCoA 排序 + adonis2 置换检验 + PERMANOVA R² + VPA（Genus / Country / extract） | `result_figure/beta_diversity/`、`result_table/adonis2_results_3regions.tsv`、`result_table/vpa_fractions_3regions.tsv` |
+| 7.5 | 影响因素分析（Host / Country / extract / Region） | `result_table/variable_analysis/` |
+| 7.6 | Country 与 Host(属) 因素比较 | 对比表 / 对比图 |
+
+**检查点约定**：β 多样性（Bray-Curtis 距离）计算耗时较长，本地已有 `rds/bray_dist_*.rds` 时直接复用（代码仍保留等价计算）；服务器完成的 T=0 网格搜索同样以检查点复用 `rds/t0_grid_*.rds`（保留镜像代码）。其余环节运行即重算并覆盖既有文件。
+
+## 7.1 环境与路径配置
+
+```{r hsm-setup}
+# 环境配置：加载共享工具函数、定义 Host_Seed_microbiota 输入输出路径
+suppressPackageStartupMessages({
+  library(data.table); library(ape); library(vegan); library(ggplot2)
+  library(ggtree); library(ggtreeExtra); library(phytools); library(cluster)
+  library(ecodist); library(dplyr); library(tidyr); library(RColorBrewer)
+  library(patchwork)
+})
+source("scripts/R/Tools.R")
+source("scripts/R/host_seed_utils.R")
+
+HOUT_ROOT <- "result/Host_Seed_microbiota"
+RDS_DIR   <- file.path(HOUT_ROOT, "rds")
+FIG_DIR   <- file.path(HOUT_ROOT, "result_figure")
+TAB_DIR   <- file.path(HOUT_ROOT, "result_table")
+FIG_ALPHA <- file.path(FIG_DIR, "alpha_diversity")
+FIG_BETA  <- file.path(FIG_DIR, "beta_diversity")
+FIG_CLUST <- file.path(FIG_DIR, "clustering")
+VAR_DIR   <- file.path(TAB_DIR, "variable_analysis")
+for (d in c(RDS_DIR, FIG_DIR, TAB_DIR, FIG_ALPHA, FIG_BETA, FIG_CLUST, VAR_DIR))
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+
+# 区域：α/β 多样性覆盖全 6 区段；α 树图 / 分层柱状图 / β 关联分析用 3 个主区段
+REGIONS_ALL <- c("v4", "v5_v7", "its1", "v3_v4", "v5_v6", "its2")
+REGIONS3    <- c("v4", "v5_v7", "its1")
+```
+
+## 7.2 计算所有区段的 α 与 β 多样性
+
+```{r hsm-diversity}
+# 计算并保存 6 个区段的样本级 α 多样性（Shannon/Simpson/Observed/Pielou）
+# 与 β 多样性（Bray-Curtis 距离）。检查点：rds 已存在则跳过。
+# 注：Bray-Curtis 计算耗时较长，本地已复用服务器计算结果；删除 rds 后运行本块可重新计算。
+REGION_CFG <- list(
+  v3_v4 = list(meta = "standard_merge/metadata_16S.txt", filt = "V3_V4"),
+  v4    = list(meta = "standard_merge/metadata_16S.txt", filt = "V4"),
+  v5_v6 = list(meta = "standard_merge/metadata_16S.txt", filt = "V5_V6"),
+  v5_v7 = list(meta = "standard_merge/metadata_16S.txt", filt = "V5_V7"),
+  its1  = list(meta = "standard_merge/metadata_ITS.txt", filt = "ITS1"),
+  its2  = list(meta = "standard_merge/metadata_ITS.txt", filt = "ITS2")
+)
+load_region_otu <- function(reg, base_dir = ".") {
+  cfg <- REGION_CFG[[reg]]
+  raw <- data.table::fread(file.path(base_dir, "standard_region", reg,
+                                     sprintf("css_%s_asvtab.txt", reg)),
+                           sep = "\t", header = TRUE)
+  otu_mat <- as.matrix(raw[, -1, with = FALSE])
+  rownames(otu_mat) <- as.character(raw[[1]])          # ASV 行名 → 转置后为样本行名
+  otu <- t(otu_mat); rm(raw, otu_mat); invisible(gc())
+  meta_full <- data.table::fread(file.path(base_dir, cfg$meta), sep = "\t", header = TRUE)
+  meta <- as.data.frame(meta_full[meta_full$Region == cfg$filt, ])
+  common <- intersect(rownames(otu), meta$SampleID)
+  if (length(common) == 0) {
+    fixed <- gsub("^X", "", rownames(otu)); common <- intersect(fixed, meta$SampleID)
+    if (length(common) > 0) rownames(otu) <- fixed     # X 前缀兜底
+  }
+  otu  <- otu[common, , drop = FALSE]
+  meta <- meta[match(common, meta$SampleID), , drop = FALSE]
+  zero <- colSums(otu) <= 0
+  if (any(zero)) otu <- otu[, !zero, drop = FALSE]
+  list(otu = otu, meta = meta)
+}
+
+for (reg in REGIONS_ALL) {
+  alpha_rds <- file.path(RDS_DIR, sprintf("alpha_div_%s.rds", reg))
+  bray_rds  <- file.path(RDS_DIR, sprintf("bray_dist_%s.rds", reg))
+  if (file.exists(alpha_rds) && file.exists(bray_rds)) {
+    cat(sprintf("  [%s] α/β RDS 已存在，跳过\n", reg)); next
+  }
+  d <- load_region_otu(reg)
+  if (!file.exists(alpha_rds)) {
+    adf <- calc_alpha_div(d$otu)
+    adf <- merge(adf, d$meta[, c("SampleID", "species", "Order", "Family", "Genus")],
+                 by = "SampleID", all.x = TRUE)
+    saveRDS(adf, alpha_rds)
+    cat(sprintf("  saved %s (%d samples)\n", alpha_rds, nrow(adf)))
+  }
+  if (!file.exists(bray_rds)) {
+    bd <- vegan::vegdist(d$otu, method = "bray")
+    saveRDS(bd, bray_rds)
+    cat(sprintf("  saved %s (size %d)\n", bray_rds, attr(bd, "Size")))
+  }
+}
+```
+
+## 7.3 α 多样性分析（V4 / V5_V7 / ITS1）
+
+### 7.3.1 数据加载与宿主颜色映射表
+
+```{r hsm-alpha-data}
+# 加载 3 个主区段数据（丰度表 + metadata + 宿主树）并挂载样本级 α 多样性
+all_data <- setNames(
+  lapply(REGIONS3, function(reg) load_region_data(reg, base_dir = ".", verbose = FALSE)),
+  REGIONS3)
+for (reg in REGIONS3)
+  all_data[[reg]]$alpha <- as.data.frame(readRDS(file.path(RDS_DIR, sprintf("alpha_div_%s.rds", reg))))
+
+# 全局宿主分类颜色映射表（已存在则加载，否则重建）
+cm_rds  <- file.path(RDS_DIR, "color_map.rds")
+cmf_rds <- file.path(RDS_DIR, "color_map_flat.rds")
+if (file.exists(cm_rds) && file.exists(cmf_rds)) {
+  color_map      <- readRDS(cm_rds)
+  color_map_flat <- readRDS(cmf_rds)
+  cat("加载已有颜色映射表 color_map / color_map_flat\n")
+} else {
+  all_meta <- do.call(rbind, lapply(all_data, function(x)
+    x$meta[, c("SampleID", "Order", "Family", "Genus", "species")]))
+  all_meta <- all_meta[!duplicated(all_meta$SampleID), ]
+  color_map      <- build_color_map(all_meta)               # 原分层渐变配色
+  color_map_flat <- build_color_map_flat(all_meta)          # 扁平配色（Family/Genus 共用 Order 色）
+  saveRDS(color_map, cm_rds); saveRDS(color_map_flat, cmf_rds)
+}
+```
+
+### 7.3.2 两种 α 多样性的宿主系统发育信号 + 环形树图
+
+```{r hsm-phylo-alpha}
+# Shannon 与 Observed 两种 α 多样性，分别：
+#   ① 对宿主物种树做 phylosig（Blomberg's K + Pagel's λ）检验系统发育信号
+#   ② 绘制环形宿主树 + 外圈 α 多样性柱状图（分区图 + 3 区组合图）
+# 输出：result_figure/alpha_diversity/phylo_alpha_*.pdf/.jpg + phylo_alpha_combined_*.pdf/.jpg
+#       result_table/phylosig_results.csv
+source("scripts/R/plot_phylo_alpha_combined.R")
+```
+
+```{r hsm-phylosig}
+# 系统发育信号结果表（每区 Shannon + Observed 两行）
+phylosig_tab <- read.csv(file.path(TAB_DIR, "phylosig_results.csv"))
+knitr::kable(phylosig_tab,
+             caption = "宿主系统发育信号（Blomberg's K 与 Pagel's λ，两种 α 多样性）",
+             digits = 4)
+```
+
+### 7.3.3 系统发育信号 bootstrap 加固（λ 95% CI）
+
+```{r hsm-phylosig-boot}
+# 对 7.3.2 的 Pagel's λ 点估计做 bootstrap 加固（样本级重抽样，B=500，并行 8 核）：
+#   每个区域×指数的 λ 95% CI + 16S vs ITS 森林图 + bootstrap 分布密度图。
+#   唯一耗时环节（bootstrap）以 rds/boot_lambda_samples.rds 为检查点，存在即复用（FORCE_BOOT=TRUE 强制重算）。
+# 输出：result_table/phylosig_lambda_ci.tsv + result_figure/alpha_diversity/fig_lambda_{forest,boot_density}.{pdf,jpg}
+source("scripts/R/phylosig_bootstrap_ci.R")
+```
+
+```{r hsm-tab-phylosig-boot}
+# λ 点估计 + bootstrap 95% CI（物种均值估计抽样误差传导到 λ 的不确定性）
+phylosig_boot_tab <- data.table::fread(file.path(TAB_DIR, "phylosig_lambda_ci.tsv"))
+knitr::kable(phylosig_boot_tab[, .(combo, lambda, ci_low, ci_high, contains_zero,
+                                   lambda_P, K_P)],
+             caption = "系统发育信号 bootstrap 加固：Pagel's λ 点估计与 95% CI（物种内样本重抽样，B=500）；contains_zero = CI 含 0",
+             digits = 4)
+```
+
+```{r hsm-fig-phylosig-boot, out.width="100%", fig.cap="λ ± 95% CI 森林图（细菌 vs 真菌，细菌 V4/V5-V7 λ 明显 > 0，真菌 ITS1 λ≈0）与 bootstrap 分布密度图（虚线=95% CI 界，实线=观测 λ）。"}
+# 注意：include_graphics 须一次传向量（for 循环内调用不输出）
+phylosig_boot_jpgs <- file.path(FIG_ALPHA,
+                                c("fig_lambda_forest.jpg", "fig_lambda_boot_density.jpg"))
+phylosig_boot_jpgs <- phylosig_boot_jpgs[file.exists(phylosig_boot_jpgs)]
+if (length(phylosig_boot_jpgs)) knitr::include_graphics(phylosig_boot_jpgs)
+```
+
+### 7.3.4 分层柱状图（3 区域 × 3 分类层级）
+
+```{r hsm-boxplot}
+# 分层箱线图：每区域 3 行面板（Genus/Family/Order），K-W 检验标注 P 值
+# ① 原渐变配色版（输出到 Host_Seed_microbiota 根目录，保持既有布局）
+layered_boxplot(all_data, color_map, alpha_idx = "Shannon",
+                out_dir = HOUT_ROOT, prefix = "alpha_boxplot_layered")
+# ② 扁平配色版（Shannon）
+layered_boxplot(all_data, color_map_flat, alpha_idx = "Shannon",
+                out_dir = FIG_ALPHA, prefix = "alpha_boxplot_layered_flat")
+# ③ 扁平配色版（Observed 丰富度，log10 轴）
+layered_boxplot(all_data, color_map_flat, alpha_idx = "Observed",
+                out_dir = FIG_ALPHA, prefix = "alpha_boxplot_layered_observed",
+                log10_transform = TRUE)
+```
+
+```{r hsm-fig-alpha, out.width="100%"}
+# α 多样性树图（组合图）+ 分层柱状图
+for (f in c("phylo_alpha_combined_shannon.jpg", "phylo_alpha_combined_observed.jpg",
+            "alpha_boxplot_layered_flat.jpg", "alpha_boxplot_layered_observed.jpg")) {
+  fp <- file.path(FIG_ALPHA, f)
+  if (file.exists(fp)) knitr::include_graphics(fp)
+}
+```
+
+## 7.4 β 多样性分析
+
+### 7.4.1 微生物群落矩阵 vs 宿主遗传发育矩阵（Mantel / MRM / dbRDA）
+
+```{r hsm-mantel-run}
+# 对每区段：物种级平均微生物 Bray-Curtis 距离 vs 宿主物种树 cophenetic 距离
+#   Mantel 检验（vegan）、MRM（ecodist）、dbRDA（vegan::capscale + anova 999 置换）
+mantel_results <- list(); mantel_plots <- list(); dbrda_plots <- list()
+for (reg in REGIONS3) {
+  bray_rds <- file.path(RDS_DIR, sprintf("bray_dist_%s.rds", reg))
+  pre_bray <- if (file.exists(bray_rds)) readRDS(bray_rds) else NULL  # 复用已有 β 距离
+  res <- mantel_mrm_analysis(all_data[[reg]], out_dir = FIG_BETA, bray_dist = pre_bray)
+  if (!is.null(res)) {
+    if (is.null(pre_bray)) saveRDS(res$bray_dist, bray_rds)
+    mantel_results[[reg]] <- res
+    mantel_plots[[reg]]   <- res$plot_mantel
+    dbrda_plots[[reg]]    <- res$plot_dbrda
+  }
+}
+mantel_tab <- do.call(rbind, lapply(names(mantel_results), function(reg) {
+  r <- mantel_results[[reg]]
+  data.frame(Region = reg, Mantel_r = r$mantel_r, Mantel_P = r$mantel_p,
+             MRM_R2 = r$mrm_r2, MRM_R2_P = r$mrm_r2p, MRM_F = r$mrm_F, MRM_F_P = r$mrm_Fp,
+             dbRDA_R2 = r$dbrda_r2, dbRDA_P = r$dbrda_p, N_Species = r$n_species)
+}))
+write.csv(mantel_tab, file.path(TAB_DIR, "mantel_mrm_results.csv"), row.names = FALSE)
+
+if (length(mantel_plots) > 0) {
+  p_mantel <- patchwork::wrap_plots(mantel_plots, ncol = length(mantel_plots)) +
+    patchwork::plot_annotation(
+      title = "Host Phylogenetic Distance vs Microbial Community Dissimilarity",
+      theme = ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 14, hjust = 0.5)))
+  save_fig(p_mantel, "mantel_mrm_combined", FIG_BETA, w = 5 * length(mantel_plots), h = 5)
+  p_dbrda <- patchwork::wrap_plots(dbrda_plots, ncol = length(dbrda_plots)) +
+    patchwork::plot_annotation(
+      title = "dbRDA: Host Phylogenetic PCoA Constrained Ordination",
+      theme = ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 14, hjust = 0.5)))
+  save_fig(p_dbrda, "dbrda_combined", FIG_BETA, w = 6 * length(dbrda_plots), h = 6)
+}
+```
+
+```{r hsm-mantel}
+mantel_tab <- read.csv(file.path(TAB_DIR, "mantel_mrm_results.csv"))
+knitr::kable(mantel_tab,
+             caption = "Mantel / MRM / dbRDA 结果（宿主遗传距离 vs 微生物群落差异）",
+             digits = 4)
+```
+
+```{r hsm-fig-beta, out.width="100%"}
+# Mantel+MRM 散点组合图 + dbRDA 排序组合图
+for (f in c("mantel_mrm_combined.jpg", "dbrda_combined.jpg")) {
+  fp <- file.path(FIG_BETA, f)
+  if (file.exists(fp)) knitr::include_graphics(fp)
+}
+```
+
+### 7.4.2 T=0 网格搜索最佳聚类方法与 k + 聚类树
+
+```{r hsm-t0-grid}
+# T=0 网格搜索：8 种层次聚类方法 × k = 2..K_MAX（T=0 = 不对 Bray-Curtis 相似度做截断）。
+# 该计算在服务器完成（rds 已 scp 回本地）；此处保留等价本地镜像代码，
+# 检查点：t0_grid_*.rds 已存在则直接复用，不重复计算。
+K_MAX <- 400
+for (reg in REGIONS3) {
+  out_rds <- file.path(RDS_DIR, sprintf("t0_grid_%s.rds", reg))
+  if (file.exists(out_rds)) {
+    cat(sprintf("  [%s] %s 已存在（服务器结果）— 复用\n", reg, out_rds)); next
+  }
+  bray <- readRDS(file.path(RDS_DIR, sprintf("bray_dist_%s.rds", reg)))
+  n <- attr(bray, "Size"); k_vec <- 2:min(K_MAX, n - 1)
+  grid_rows <- list()
+  for (m in METHODS_ALL) {
+    hc <- tryCatch(stats::hclust(bray, method = m), error = function(e) NULL)
+    if (is.null(hc)) next
+    for (k in k_vec) {
+      lab <- tryCatch(stats::cutree(hc, k = k), error = function(e) NULL)
+      if (is.null(lab)) next
+      tab <- table(lab)
+      if (length(tab) < 2 || any(tab == n - 1)) next
+      sil <- tryCatch(mean(cluster::silhouette(lab, bray)[, "sil_width"]),
+                      error = function(e) NA_real_)
+      if (!is.na(sil))
+        grid_rows[[length(grid_rows) + 1L]] <-
+          data.frame(method = m, threshold = 0, k = k, silhouette = sil)
+    }
+  }
+  grid <- do.call(rbind, grid_rows); rownames(grid) <- NULL
+  best <- do.call(rbind, lapply(METHODS_ALL, function(m) {
+    sub <- grid[grid$method == m, , drop = FALSE]
+    if (nrow(sub)) sub[which.max(sub$silhouette), , drop = FALSE] else NULL
+  }))
+  best_global <- best[which.max(best$silhouette), , drop = FALSE]
+  saveRDS(list(grid = grid, best = best, best_global = best_global), out_rds)
+  cat(sprintf("  [%s] T=0 grid done: %d combos, best %s k=%d sil=%.4f\n",
+              reg, nrow(grid), best_global$method, best_global$k, best_global$silhouette))
+}
+```
+
+```{r hsm-host-match}
+# 聚类 vs 宿主分类一致性评估：对 T=0 全网格重算外部验证指标
+# （ARI / NMI / 加权纯度 / 同质性 / 完整性 / V-measure / 分裂度，
+#   宿主 Order / Family / Genus / species 四层级）
+# 输出：rds/host_match_t0_*.rds、result_table/host_match_t0_*.csv + host_match_t0_summary.csv、
+#       result_figure/clustering/host_match_t0_*.pdf/.jpg
+source("scripts/R/assess_host_match_t0.R")
+```
+
+```{r hsm-cluster-summary}
+# 每区域每方法最优参数（silhouette 与 ARI(genus)）汇总
+hm_summary <- read.csv(file.path(TAB_DIR, "host_match_t0_summary.csv"))
+hm_compact <- hm_summary[, c("region", "method", "best_sil_k", "best_sil",
+                             "best_ari_genus_k", "best_ari_genus", "sil_at_ari_genus")]
+knitr::kable(hm_compact,
+             caption = "T=0 聚类每方法最优参数（best_sil 按轮廓系数，best_ari_genus 按 ARI(genus)）",
+             digits = 3)
+```
+
+```{r hsm-cluster-tree}
+# T=0 聚类树：每区两棵环形树（minK = 最优 k 最小的达标方法；bestARI = 全网格 ARI(genus) 最高）
+# 输出：result_figure/clustering/cluster_tree_t0_*.pdf/.jpg + rds/t0_cluster_trees_*.rds
+source("scripts/R/plot_t0_cluster_tree.R")
+```
+
+```{r hsm-fig-cluster, out.width="100%"}
+# 聚类一致性 k 曲线（灰 = silhouette，彩色 = ARI vs 宿主 Order/Family/Genus/species）
+hm_jpgs <- sort(list.files(FIG_CLUST, pattern = "^host_match_t0_.*\\.jpg$", full.names = TRUE))
+if (length(hm_jpgs)) knitr::include_graphics(hm_jpgs)
+# T=0 聚类树（minK + bestARI，每区两棵）
+tree_jpgs <- sort(list.files(FIG_CLUST, pattern = "^cluster_tree_t0_.*\\.jpg$", full.names = TRUE))
+if (length(tree_jpgs)) knitr::include_graphics(tree_jpgs)
+```
+
+### 7.4.3 β 多样性因素分解：PCoA 排序 + adonis2 + VPA
+
+目的：量化宿主属（Genus）、来源国（Country）、提取方式（extract）对 β 多样性
+（Bray-Curtis 距离）的影响强度。adonis2 置换检验（`by="margin"`，999 置换）给出三因素的
+边际 R² 与 P；PCoA 排序图按宿主 Order 着色并共享图例；VPA（方差变异分配）进一步把变异
+拆给三因素的独立 / 交互项与残差。
+
+```{r hsm-beta-factor-run}
+# 图1（PCoA + adonis2 摘要）、图2（PERMANOVA R² 柱状图）与对应结果表。
+# 检查点 rds/adonis2_checkpoint_N999.rds 已存在时跳过重算（N=999 全量置换，v4 约 10+ 分钟）。
+source("scripts/R/beta_pcoa_adonis.R")
+```
+
+```{r hsm-beta-factor-tab}
+# adonis2 边际检验结果表（R² = 该因素独立解释比例，P = 999 置换 p 值）
+adonis_tab <- data.table::fread(file.path(TAB_DIR, "adonis2_results_3regions.tsv"))
+knitr::kable(adonis_tab, digits = 4,
+             caption = "adonis2 边际检验（distance ~ Genus + Country + extract, by = margin, 999 permutations）")
+```
+
+```{r hsm-beta-factor-fig, out.width="100%"}
+# 图1：PCoA 三面板（点色 = 宿主 Order，共享图例；面板内右上角 = 三因素 adonis2 摘要）
+# 图2：PERMANOVA 边际 R² 柱状图（factor × region）
+for (f in c("pcoa_adonis_3regions.jpg", "permanova_R2_3regions.jpg")) {
+  fp <- file.path(FIG_BETA, f)
+  if (file.exists(fp)) knitr::include_graphics(fp)
+}
+```
+
+```{r hsm-beta-vpa-run}
+# 图3：VPA（方差变异分配）三面板 Venn 图 + 变异分解表
+source("scripts/R/beta_vpa.R")
+```
+
+```{r hsm-beta-vpa-tab}
+vpa_tab <- data.table::fread(file.path(TAB_DIR, "vpa_fractions_3regions.tsv"))
+knitr::kable(vpa_tab, digits = 4,
+             caption = "VPA 方差变异分配（adj.R² = 各因素组合对 Bray-Curtis 距离变异的解释比例，含交互与残差）")
+```
+
+```{r hsm-beta-vpa-fig, out.width="100%"}
+# 图3：VPA 三面板 Venn（Genus / Country / Extract 的独立与交互解释 + 残差）
+vp_fp <- file.path(FIG_BETA, "vpa_3regions.jpg")
+if (file.exists(vp_fp)) knitr::include_graphics(vp_fp)
+```
+
+**主要发现**（数据见上表与图）：
+- **宿主属（Genus）主导群落变异**：adonis2 边际 R² = 0.118 / 0.353 / 0.336（V4 / V5_V7 / ITS1），
+  均为最强因素且 P < 0.001；VPA 中 Genus 独立解释（纯 a，adj.R²）≈ 0.10 / 0.31 / 0.31，而
+  Country / extract 各仅个位数百分比——宿主身份是种子微生物群落结构的主要驱动。
+- **提取方式（extract）影响微弱但显著**：边际 R² 仅 0.002–0.009，VPA 纯 c 均 ≤ 0.01
+  （组织提取 vs 表面消毒）。
+- **VPA 与 adonis2 一致**：三因素合计 adj.R² = 0.286 / 0.421 / 0.497（v4 / v5_v7 / its1），
+  残差仍占约 50–71%，反映未纳入的随机 / 技术变异。
+
+## 7.5 影响因素分析（4 个变量）
+
+```{r hsm-variable}
+# 探索 4 种变量（Host / Country / extract / Region）对种子微生物群落的影响：
+#   固定其余 3 个变量 → 按目标变量分组（组数 ≥ 2、每组样本数 ≥ 3）→ 组间两两比较
+#   α：4 指数（Shannon/Simpson/Observed/Pielou）Welch t 检验
+#   β：组间平均 Bray-Curtis 距离 + 999 次标签置换检验（Region 无跨区矩阵，跳过 β）
+# 输出：result_table/variable_analysis/<var>_{significance,detail,grouping}.csv
+#       + summary_all_variables.csv
+source("scripts/R/variable_impact_analysis.R")
+```
+
+```{r hsm-variable-summary}
+var_summary <- read.csv(file.path(VAR_DIR, "summary_all_variables.csv"))
+knitr::kable(var_summary, caption = "影响因素分析汇总（固定变量组合数 / 配对检验数）")
+```
+
+## 7.6 Country 与 Host(属) 因素比较
+
+```{r hsm-country-vs-host}
+# 基于显著性表比较 Country 与 Host(属) 的影响强度（显著率，Y 占比）
+read_sig <- function(v) read.csv(file.path(VAR_DIR, sprintf("%s_significance.csv", v)),
+                                 stringsAsFactors = FALSE)
+sig_rate <- function(df, col) {
+  v <- df[[col]]; v <- v[!is.na(v)]
+  if (!length(v)) NA_real_ else round(mean(v == "Y"), 3)
+}
+host_sig <- read_sig("Host"); country_sig <- read_sig("Country")
+cols <- c("Shannon_sig", "Simpson_sig", "Observed_sig", "Pielou_sig", "Beta_sig")
+cmp_df <- data.frame(
+  Indicator        = sub("_sig$", "", cols),
+  Host_pairs       = sapply(cols, function(c) sum(!is.na(host_sig[[c]]))),
+  Host_sig_rate    = sapply(cols, function(c) sig_rate(host_sig, c)),
+  Country_pairs    = sapply(cols, function(c) sum(!is.na(country_sig[[c]]))),
+  Country_sig_rate = sapply(cols, function(c) sig_rate(country_sig, c)))
+knitr::kable(cmp_df, caption = "显著率比较：Host(属) vs Country（Y 占比）", digits = 3)
+
+cmp_long <- tidyr::pivot_longer(
+  cmp_df[, c("Indicator", "Host_sig_rate", "Country_sig_rate")],
+  cols = c("Host_sig_rate", "Country_sig_rate"),
+  names_to = "Factor", values_to = "sig_rate")
+cmp_long$Factor <- sub("_sig_rate$", "", cmp_long$Factor)
+p_cmp <- ggplot2::ggplot(cmp_long,
+                         ggplot2::aes(x = Indicator, y = sig_rate, fill = Factor)) +
+  ggplot2::geom_col(position = ggplot2::position_dodge(0.7), width = 0.6) +
+  ggplot2::geom_text(ggplot2::aes(label = sprintf("%.1f%%", sig_rate * 100)),
+                     position = ggplot2::position_dodge(0.7), vjust = -0.3, size = 3) +
+  ggplot2::scale_y_continuous(labels = function(x) paste0(x * 100, "%"),
+                              limits = c(0, 1.08)) +
+  ggplot2::labs(title = "Host(属) vs Country 影响显著率比较",
+                x = NULL, y = "显著率", fill = NULL) +
+  ggplot2::theme_bw(base_size = 11) +
+  ggplot2::theme(panel.grid.minor = ggplot2::element_blank(),
+                 legend.position = "top")
+print(p_cmp)
+dir.create("result/Host_Seed_microbiota/result_figure/Country_vs_Host", showWarnings = FALSE)
+ggsave("result/Host_Seed_microbiota/result_figure/Country_vs_Host/Country_vs_Host.png", p_cmp, width = 14, height = 7, dpi = 300)
+```
+
+**比较结论**（数据见上表，详见 README「变量影响分析」章节）：
+- **宿主效应远强于国家效应**：β 显著率 Host 97.9% vs Country 62.4%；各 α 指数显著率 Host 58–71% vs Country 26–36%。Host 组间 β 平均距离 ~0.97（接近 Bray-Curtis 上限，不同宿主属的种子微生物群落几乎不重叠）。
+- **两者皆"组成(β)敏感、多样性(α)不敏感"**：β 显著率 > 任一 α 指数；存在"α 全不显著但 β 显著"的对（Host 14%、Country 19%）。
+- **样本量依赖不同**：Host 即使两组总样本 ≤ 20 时 β 显著率仍 98%；Country ≤ 20 仅 38% 显著、> 50 后接近全显著。
+- **caveat（数据不平衡）**：Host 的 ~88% 对数（2257/2556）来自 `Country=China|extract=P|V5_V7` 与 `Country=China|extract=P|ITS1` 两个组合，宿主效应几乎全由"中国 + 组织提取 + 两个测序区"估计，与研究 / 批次效应存在混杂风险，解读需注明。
+
+## 7.7 宿主遗传距离 × 地理因素（国家）对群落组装的影响（iCAMP 双轴分析）
+
+目的：用 iCAMP 零模型框架（βNTI + RCbray，服务器 iCAMP 1.5.12，rand=1000）在两轴上独立检验"宿主筛选"与"地理/环境选择"对种子微生物群落组装的相对贡献。
+
+- **轴 1（宿主筛选）**：`Country × extract` 池（地理/技术锁死）→ βNTI 随宿主遗传距离的变化（互斥谱系箱 + 连续 cophenetic 距离）+ 生态过程分类（|βNTI|=2 判据）。
+- **轴 2（地理/环境选择）**：`Genus × extract` 池（宿主/技术锁死）→ 跨国样本对的 βNTI ~ 国家质心地理距离 MRM（池内置换）。
+- **S60 受控子集**：本实验室同批样本（同提取 P / 同国 China / 仅宿主差异）→ 细菌(V5_V7) vs 真菌(ITS1) 过程组成对比。
+- **同国 vs 跨国**：Genus 池内同国对 vs 跨国对的过程组成差异（两组仅地理差异，宿主层级锁死同属、提取锁死同 extract）。
+
+**处理流程**（服务器侧；产物已就位，本 RMD 以 eval=FALSE 镜像展示、不实际运行——"伪装本地跑的"）：
+1. 本地分池 `scripts/R/bnti_assembly_prep.R` → `result_table/bnti/inputs/` + `task_list/`
+2. 服务器建树 `scripts/shell/bnti_build_asv_trees.sh`（mafft → trimal → FastTreeMP）→ `inputs/{reg}/{reg}_asv_tree.nwk`
+3. 服务器预处理 `scripts/R/bnti_prep_server.R`（comm/tree/pd.big/host_dist，pd.big 留服务器）
+4. 服务器任务调度 `scripts/shell/bnti_run_all_tasks.sh`（GNU parallel，三区共 274 任务；单任务 `scripts/R/bnti_run_task.R`）
+5. 下机结果回传 → `result_table/bnti/pair_info/{reg}/{Task}/pair_info.csv`
+
+**下游分析**（本流程**本地真正执行**部分；表 → `result_table/bnti/`，图 → `result_figure/bnti/`）：
+- `scripts/R/bnti_integrate_results.R`（轴1/轴2/轴3 三区平行）
+- `scripts/R/bnti_s60_subset_analysis.R` + `bnti_s60_combine.R`（S60）
+- `scripts/R/bnti_country_process_analysis.R`（同国/跨国）
+
+### 7.7.1 环境与配置
+
+```{r bnti-setup}
+# 结果表 / 图输出目录（脚本内由 BASE_DIR 环境变量覆盖，默认 D:/seed_meta_new/Downstream_analysis）
+BNTI_TAB <- "result/Host_Seed_microbiota/result_table/bnti"
+BNTI_FIG <- "result/Host_Seed_microbiota/result_figure/bnti"
+```
+
+### 7.7.2 处理流程（服务器侧，eval=FALSE 镜像展示，产物已就位）
+
+```{r bnti-proc-assembly, eval=FALSE}
+# Step 1 本地分池：分区 metadata + 建树 ASV 集（union 全区 top5000 & 各 extract top3000）+ 分池任务表
+#   产物已就位：result_table/bnti/inputs/{reg}/metadata_{reg}.csv、{reg}_tree_input.fa、{reg}_tree_asv_ids.txt
+#              result_table/bnti/task_list/task_list_{reg}.csv（v4 88 / v5_v7 76 / its1 110 任务）
+Sys.setenv(REGION = "v4")
+source("scripts/R/bnti_assembly_prep.R")
+```
+
+```{r bnti-proc-tree, eval=FALSE}
+# Step 2 服务器建树（三区并行；完整脚本 scripts/shell/bnti_build_asv_trees.sh）：
+#   mafft --auto --thread 100 {reg}_tree_input.fa > {reg}_mafft.fa
+#   trimal -in {reg}_mafft.fa -out {reg}_mafft_trimmed.fa -automated1
+#   FastTreeMP -nt -gtr -gamma {reg}_mafft_trimmed.fa > {reg}_asv_tree.nwk
+#   产物 {reg}_asv_tree.nwk 已回传 result_table/bnti/inputs/{reg}/
+```
+
+```{r bnti-proc-prep, eval=FALSE}
+# Step 3 服务器预处理（iCAMP 1.5.12）：comm/tree/pd.big/host_dist_mat（pd.big 留服务器，各池复用）
+#   脚本 scripts/R/bnti_prep_server.R；本次实际 274 任务全部由服务器完成
+#   Rscript scripts/R/bnti_prep_server.R v4 /nvme/seed_analysis
+```
+
+```{r bnti-proc-run, eval=FALSE}
+# Step 4 服务器任务调度（GNU parallel，单任务 nworker=32；脚本 scripts/shell/bnti_run_all_tasks.sh）：
+#   bash scripts/shell/bnti_run_all_tasks.sh v4 /nvme/seed_analysis 8
+#   单任务零模型（脚本 scripts/R/bnti_run_task.R）：
+#     βNTI  = bNTI.cm(sig.index="SES", rand=1000, nworker=32, memo.size.GB=200)
+#     RCbray = RC.cm(rand=1000, nworker=32, sig.index="RC")
+#     Process 由 |βNTI|±1.96 + |RCbray|0.95 派生（iCAMP 标准判据）
+```
+
+```{r bnti-proc-transfer, eval=FALSE}
+# Step 5 下机结果回传：pair_info.csv 批量 scp → result_table/bnti/pair_info/{reg}/{TaskName}/
+#   每文件 20 列：Region/TaskName/TaskType/Sample1,2/betaNTI/RCbray/Process/
+#                 Country_1,2/Genus_1,2/Family_1,2/Species_1,2/HostGeneticDist/
+#                 SameGenus/CrossCountry/GeneticBin（GeneticBin 为物种级四类，下游按 7 级谱系箱重算）
+# 大池策略（本次未启用）：基准测试 scripts/R/bnti_benchmark.R；去重备选 scripts/R/bnti_dedup_samples.R
+```
+
+### 7.7.3 下游分析（本地执行，基于服务器下机结果）
+
+```{r bnti-run-integrate-v4}
+Sys.setenv(REGION = "v4"); source("scripts/R/bnti_integrate_results.R")
+```
+
+```{r bnti-run-integrate-v5_v7}
+Sys.setenv(REGION = "v5_v7"); source("scripts/R/bnti_integrate_results.R")
+```
+
+```{r bnti-run-integrate-its1}
+Sys.setenv(REGION = "its1"); source("scripts/R/bnti_integrate_results.R")
+```
+
+```{r bnti-run-s60-v5_v7}
+Sys.setenv(REGION = "v5_v7"); source("scripts/R/bnti_s60_subset_analysis.R")
+```
+
+```{r bnti-run-s60-its1}
+Sys.setenv(REGION = "its1"); source("scripts/R/bnti_s60_subset_analysis.R")
+```
+
+```{r bnti-run-s60-combine}
+source("scripts/R/bnti_s60_combine.R")
+```
+
+```{r bnti-run-country}
+source("scripts/R/bnti_country_process_analysis.R")
+```
+
+### 7.7.4 结果表
+
+```{r bnti-tab-axis1}
+bnti_axis1 <- data.table::rbindlist(lapply(c("v4", "v5_v7", "its1"), function(r) {
+  d <- data.table::fread(file.path(BNTI_TAB, "integrate", r, sprintf("axis1_summary_%s.tsv", r)))
+  d$Region <- r; d
+}))
+bnti_axis1 <- bnti_axis1[order(Region, GeneticBin),
+                         .(Region, GeneticBin, n_pairs, betaNTI_median, betaNTI_IQR, frac_determ, frac_drift)]
+knitr::kable(bnti_axis1,
+             caption = "轴 1（Country 池内同国对）：βNTI 中位数/IQR 与确定性/漂移比例随互斥谱系箱（Same_Species→Cross_Phylum）变化；空箱自动剔除",
+             digits = 3)
+```
+
+```{r bnti-tab-axis1-kruskal}
+bnti_kw <- data.table::rbindlist(lapply(c("v4", "v5_v7", "its1"), function(r) {
+  d <- data.table::fread(file.path(BNTI_TAB, "integrate", r, sprintf("axis1_kruskal_%s.tsv", r)))
+  d$Region <- r; d
+}))
+knitr::kable(bnti_kw[, .(Region, statistic, parameter, p.value)],
+             caption = "轴 1：βNTI ~ 谱系箱 Kruskal-Wallis 检验（三区均 p<1e-15）", digits = 3)
+```
+
+```{r bnti-tab-axis2-mrm}
+bnti_mrm <- data.table::rbindlist(lapply(c("v4", "v5_v7", "its1"), function(r) {
+  d <- data.table::fread(file.path(BNTI_TAB, "integrate", r, sprintf("axis2_mrm_%s.tsv", r)))
+  d$Region <- r; d
+}), fill = TRUE)
+knitr::kable(bnti_mrm,
+             caption = "轴 2（Genus 池内同属跨国对）：βNTI ~ GeoDist 池内置换 MRM（nperm=999）；degenerate_null=TRUE 表示池内置换零分布退化（斜率几乎不变），p 无检验意义",
+             digits = 4)
+```
+
+```{r bnti-tab-proc}
+bnti_proc <- data.table::rbindlist(lapply(c("v4", "v5_v7", "its1"), function(r) {
+  d <- data.table::fread(file.path(BNTI_TAB, "integrate", r, sprintf("process_summary_axis1_%s.tsv", r)))
+  d$Region <- r; d
+}))
+bnti_proc <- bnti_proc[order(Region, Proc2),
+                       .(Region, Proc2, n_pairs, frac_total, hostdist_median, nature,
+                         pct_same_species, pct_cross_genus, pct_cross_class)]
+knitr::kable(bnti_proc,
+             caption = "轴 3 过程分类（|βNTI|=2 判据，Country 池）：每过程对数占比、宿主距离中位、跨层级占比（全部按集合内占比报告）",
+             digits = 3)
+```
+
+```{r bnti-tab-proc-chi2}
+bnti_pchi <- data.table::rbindlist(lapply(c("v4", "v5_v7", "its1"), function(r) {
+  d <- data.table::fread(file.path(BNTI_TAB, "integrate", r, sprintf("process_lineage_chi2_%s.tsv", r)))
+  d$Region <- r; d
+}))
+knitr::kable(bnti_pchi[, .(Region, statistic, df, p.value, cramers_V, p_permute_within_pool)],
+             caption = "过程 × 谱系箱 Chi-sq + Cramer's V + 池内置换 p（按 Country 池分块打乱过程标签，控制池内对共享样本的伪重复）",
+             digits = 3)
+```
+
+```{r bnti-tab-s60}
+bnti_s60 <- data.table::fread(file.path(BNTI_TAB, "s60", "s60_process_compare_v5_v7_vs_its1.tsv"))
+knitr::kable(bnti_s60[order(Region, Proc2), .(Region, Proc2, n_pairs, frac_total, nature)],
+             caption = "S60 子集（同批同提取同国）：v5_v7 vs its1 过程组成（v5_v7 确定性 15.8% vs its1 仅 2.0%）", digits = 3)
+```
+
+```{r bnti-tab-country}
+bnti_country_chi <- data.table::fread(file.path(BNTI_TAB, "country", "country_process_chi2_3regions.tsv"))
+knitr::kable(bnti_country_chi,
+             caption = "同国 vs 跨国 过程组成 Chi-sq（Genus 池；MC p 为 chisq simulate B=9999；v5_v7 跨国仅 132 对、不显著，组合图剔除）",
+             digits = 3)
+```
+
+### 7.7.5 图
+
+#### 7.7.5.1 轴 1（Country 池，宿主因素）——用户指定图
+
+```{r bnti-fig-hostgen-v4, out.width="100%", fig.cap="轴 1 连续宿主遗传距离散点（V4；n=262,191 对，HostGeneticDist>0；蓝线 lm 拟合，虚线 ±1.96）。"}
+if (file.exists(file.path(BNTI_FIG, "axis1_bNTI_by_hostgen_v4.jpg")))
+  knitr::include_graphics(file.path(BNTI_FIG, "axis1_bNTI_by_hostgen_v4.jpg"))
+```
+
+```{r bnti-fig-hostgen-v5_v7, out.width="100%", fig.cap="轴 1 连续宿主遗传距离散点（V5_V7）。"}
+if (file.exists(file.path(BNTI_FIG, "axis1_bNTI_by_hostgen_v5_v7.jpg")))
+  knitr::include_graphics(file.path(BNTI_FIG, "axis1_bNTI_by_hostgen_v5_v7.jpg"))
+```
+
+```{r bnti-fig-hostgen-its1, out.width="100%", fig.cap="轴 1 连续宿主遗传距离散点（ITS1）。"}
+if (file.exists(file.path(BNTI_FIG, "axis1_bNTI_by_hostgen_its1.jpg")))
+  knitr::include_graphics(file.path(BNTI_FIG, "axis1_bNTI_by_hostgen_its1.jpg"))
+```
+
+#### 7.7.5.2 S60 受控子集——用户指定图
+
+```{r bnti-fig-s60-genbin-combined, out.width="100%", fig.cap="S60 子集：v5_v7 与 ITS1 各谱系箱内过程组成左右拼接组图（共用图例；柱高列归一化，柱顶 n= 为该箱样本对总数）。"}
+if (file.exists(file.path(BNTI_FIG, "s60_process_by_geneticbin_v5_v7_vs_its1.jpg")))
+  knitr::include_graphics(file.path(BNTI_FIG, "s60_process_by_geneticbin_v5_v7_vs_its1.jpg"))
+```
+
+```{r bnti-fig-s60-compare, out.width="100%", fig.cap="S60 子集：v5_v7 vs its1 过程组成并排（细菌 vs 真菌组装推断差异；同批样本面板）。"}
+if (file.exists(file.path(BNTI_FIG, "s60_process_compare_v5_v7_vs_its1.jpg")))
+  knitr::include_graphics(file.path(BNTI_FIG, "s60_process_compare_v5_v7_vs_its1.jpg"))
+```
+
+#### 7.7.5.3 同国 vs 跨国（Genus 池，地理因素）——用户指定图
+
+```{r bnti-fig-country-compare, out.width="100%", fig.cap="同国 vs 跨国 过程占比分组条形（V4/ITS1 两区；Genus 池；V5_V7 跨国对仅 132 对已剔除）。"}
+if (file.exists(file.path(BNTI_FIG, "country_process_compare_3regions.jpg")))
+  knitr::include_graphics(file.path(BNTI_FIG, "country_process_compare_3regions.jpg"))
+```
+
+```{r bnti-fig-country-composition, out.width="100%", fig.cap="同国 vs 跨国 过程组成堆叠条（柱顶标注对总数 n；每柱内 sum=1）。"}
+if (file.exists(file.path(BNTI_FIG, "country_process_composition_3regions.jpg")))
+  knitr::include_graphics(file.path(BNTI_FIG, "country_process_composition_3regions.jpg"))
+```
+
+#### 7.7.5.4 补充图（v4 / its1 两主要区）
+
+```{r bnti-fig-axis1-genbin, out.width="100%", fig.cap="轴 1 互斥谱系箱线图（v4 / its1；±1.96 虚线 + 抖动散点）。"}
+for (r in c("v4", "its1")) {
+  f <- file.path(BNTI_FIG, sprintf("axis1_bNTI_by_geneticbin_%s.jpg", r))
+  if (file.exists(f)) knitr::include_graphics(f)
+}
+```
+
+```{r bnti-fig-axis1-cum, out.width="100%", fig.cap="轴 1 累积式箱线图（v4，用户预想逻辑：Cross_* 箱含全部更深跨层对，箱间样本重叠）。"}
+if (file.exists(file.path(BNTI_FIG, "axis1_bNTI_by_cumulative_bin_v4.jpg")))
+  knitr::include_graphics(file.path(BNTI_FIG, "axis1_bNTI_by_cumulative_bin_v4.jpg"))
+```
+
+```{r bnti-fig-axis2, out.width="100%", fig.cap="轴 2 跨国对 βNTI ~ 国家质心地理距离散点（v4 / its1；点色=Genus 池）。"}
+for (r in c("v4", "its1")) {
+  f <- file.path(BNTI_FIG, sprintf("axis2_bNTI_by_geodist_%s.jpg", r))
+  if (file.exists(f)) knitr::include_graphics(f)
+}
+```
+
+```{r bnti-fig-proc-heatmap, out.width="100%", fig.cap="轴 3 过程 × 谱系箱热图（v4 / its1；行归一化 = 每个过程集合内谱系占比）。"}
+for (r in c("v4", "its1")) {
+  f <- file.path(BNTI_FIG, sprintf("process_lineage_heatmap_%s.jpg", r))
+  if (file.exists(f)) knitr::include_graphics(f)
+}
+```
+
+```{r bnti-fig-proc-stacked, out.width="100%", fig.cap="轴 3 各谱系箱内过程组成堆叠条（v4 / its1；列归一化）。"}
+for (r in c("v4", "its1")) {
+  f <- file.path(BNTI_FIG, sprintf("process_by_geneticbin_%s.jpg", r))
+  if (file.exists(f)) knitr::include_graphics(f)
+}
+```
+
+```{r bnti-fig-s60-composition, out.width="100%", fig.cap="S60 子集过程占比条（v5_v7 / its1；含确定性%）。"}
+for (r in c("v5_v7", "its1")) {
+  f <- file.path(BNTI_FIG, sprintf("s60_process_composition_%s.jpg", r))
+  if (file.exists(f)) knitr::include_graphics(f)
+}
+```
+
+```{r bnti-fig-s60-lineage, out.width="100%", fig.cap="S60 子集谱系箱分布对比（v5_v7 vs its1）。"}
+if (file.exists(file.path(BNTI_FIG, "s60_lineage_compare_v5_v7_vs_its1.jpg")))
+  knitr::include_graphics(file.path(BNTI_FIG, "s60_lineage_compare_v5_v7_vs_its1.jpg"))
+```
+
+### 7.7.6 输出文件清单
+
+- **表**（`result_table/bnti/`）：`integrate/{reg}/`（axis1_summary、axis1_kruskal、axis1_summary_cumulative、axis2_mrm、axis2_mrm_perpool、axis2_poolpairs、pool_diag、process_summary_axis1、process_lineage_contingency、process_lineage_chi2、process_hostdist_test、process_summary_axis2 + integrate_report）；`s60/{reg}/` + `s60/s60_process_compare_v5_v7_vs_its1.tsv`；`country/`（country_process_summary/chi2_3regions.tsv + 每区子表）；`task_list/`（task_list + prep_report）。
+- **图**（`result_figure/bnti/`）：用户指定 5 组（axis1_bNTI_by_hostgen ×3、s60_process_by_geneticbin_v5_v7_vs_its1 拼接组图、s60_process_compare、country_process_compare/composition_3regions）＋ 补充（axis1_bNTI_by_geneticbin/cumulative_bin、axis2_bNTI_by_geodist/cross_vs_same、process_lineage_heatmap/process_by_geneticbin、s60_process_lineage_heatmap/composition、s60_lineage_compare），PDF + 300-dpi JPG 双格式。
+
+### 7.7.7 主要发现
+
+- **轴 1（宿主因素）三区 βNTI 随宿主谱系跨层显著上升**（Kruskal 均 p<1e-15）；v4 的 Cross_Class 箱 betaNTI_median=1.38、frac_determ=0.42，为各箱最高——宿主分类层级差距越大，群落组装确定性越强。
+- **细菌宿主筛选信号强于真菌**：Country 池过程分类（|βNTI|=2）确定性占比 v4 12.1%、v5_v7 10.9%、its1 仅 2.3%（Drift 主导）——ITS1 种子真菌组装近乎随机。
+- **S60 受控子集确认同一模式**：同一批样本面板下 v5_v7 确定性 15.8%（主要 Heterogeneous_selection 15.7%）vs its1 仅 2.0%（Drift 78%）——技术噪声被锁定时，宿主分类差异对细菌组装的驱动远强于真菌。
+- **轴 2（地理因素）无一致距离梯度**：v4/its1 同属跨国对 βNTI ~ 国家质心距离的整体斜率≈0（池内置换零分布退化）；逐池 ecodist::MRM 部分池显著但方向不一致——地理距离本身对组装影响弱。
+- **同国 vs 跨国（Genus 池，仅地理差异）**：跨国对确定性略升（v4 10.1%→15.1%、its1 2.8%→3.4%），跨国对 Dispersal_limitation 占比大幅升、Homogeneous_selection≈0；v4/its1 两组过程组成显著不同（Chi-sq MC p=1e-4，Cramer's V 0.32/0.17），v5_v7 跨国对仅 132 对、不显著（p=0.56）。
+- **综合**：两轴对照表明宿主谱系（轴 1）对 βNTI 的驱动远强于地理距离（轴 2），与第 7.5/7.6 节"宿主因素显著强于国家因素"的结论相互印证。
+
+# 8. GOS — 种子微生物通才/专才分析（Generalist vs Specialist）
+
+基于 0-1 存在矩阵（映射到参考序列的 ASV × 宿主物种）的两阶段方法：
+
+- **Step 1 合并**：每个宿主物种用 Anderson–Darling 正态性检验决定代表物种数 T，按流行度取前 T 个 ASV 为代表，合并为 ASV × 宿主物种 0-1 矩阵。
+- **Step 2 阈值**：对合并矩阵做 within-column 打乱（保持各宿主代表物种数不变）得到 n_hosts 零分布，与实际分布对比，用累积超额（crossing）法确定通才 n_hosts 阈值。
+- **Step 3 显著性**：对每个出现的 n_hosts=k，随机抽 k 个宿主物种计算 MPD（宿主两两遗传距离均值）零分布，得 z = (mean_dist − null_mu[k])/null_sd[k]，单尾 p 各自 BH-FDR 校正（多检验下不可用固定 |z|>1.96）。
+- **Step 4 分类**：通才 = n_hosts ≥ 阈值 且 q_clus ≥ 0.05（广度达标 + 未显著聚集，剔除仅在狭窄/近缘宿主类群中广布的假通才）；专才 = n_hosts = 1；中间型 = 其余；n_hosts = 0 = 缺失。另附 `dispersion` 属性列：显著分散（q_disp < 0.05）标为 `dispersed`、显著聚集（q_clus < 0.05）标为 `clustered`、均不显著标为 `neutral`，显著分散仅作标注属性、不参与通才硬性判定。提取通才/专才的参考序列与物种注释。
+
+## 8.0 准备：目录与路径
+
+```{r gos-0-setup}
+source("scripts/R/gos_analysis.R")
+
+GOS_ROOT <- "result/GOS"
+dirs <- gos_init_dirs(GOS_ROOT)
+GOS_TMP <- as.character(dirs["tmp"])
+GOS_TAB <- as.character(dirs["tab"])
+GOS_FIG <- as.character(dirs["fig"])
+
+# 宿主物种树 → 距离矩阵（两数据集共用）
+HOST_TREE     <- "plant_tree/plant_species_tree_all.nwk"
+HOST_DIST_RDS <- file.path(GOS_TMP, "host_dist.rds")
+
+# 迭代/抽样参数与显著性水平
+N_ITER <- 1000       # n_hosts 零分布迭代次数
+N_REP  <- 1000       # 每-n_hosts MPD 零模型抽样次数
+ALPHA  <- 0.05       # BH-FDR 显著性水平
+
+# 两数据集输入/输出路径（函数全部以参数接收路径）
+GOS_CFG <- list(
+  `16s` = list(
+    css        = "standard_merge/css_16s_asvtab.txt",
+    meta       = "standard_merge/metadata_16S.txt",
+    ref        = "raw_data_merge/Merged_16S_Silva.fa",
+    tax        = "raw_data_merge/Merged_16S_taxonomy.txt",
+    merged_txt = file.path(GOS_TAB, "presence_merged_16s.txt"),
+    merged_rds = file.path(GOS_TMP, "presence_merged_16s.rds"),
+    merge_log  = file.path(GOS_TMP, "presence_species_merge_log_16s.csv"),
+    nhost_rds  = file.path(GOS_TMP, sprintf("nhost_null_16s_iter%d.rds", N_ITER)),
+    mpd_rds    = file.path(GOS_TMP, sprintf("mpd_null_16s_rep%d.rds", N_REP)),
+    info_csv   = file.path(GOS_TAB, "gos_per_asv_info_16s.txt"),
+    classified = file.path(GOS_TAB, "gos_classified_16s.txt"),
+    threshold  = file.path(GOS_TMP, "gos_threshold_16s.rds"),
+    gen_fa     = file.path(GOS_TAB, "gos_generalist_ref_16s.fa"),
+    gen_tax    = file.path(GOS_TAB, "gos_generalist_taxonomy_16s.txt"),
+    spe_fa     = file.path(GOS_TAB, "gos_specialist_ref_16s.fa"),
+    spe_tax    = file.path(GOS_TAB, "gos_specialist_taxonomy_16s.txt")
+  ),
+  its = list(
+    css        = "standard_merge/css_its_asvtab.txt",
+    meta       = "standard_merge/metadata_ITS.txt",
+    ref        = "raw_data_merge/Merged_ITS_Unite.fa",
+    tax        = "raw_data_merge/Merged_ITS_taxonomy.txt",
+    merged_txt = file.path(GOS_TAB, "presence_merged_its.txt"),
+    merged_rds = file.path(GOS_TMP, "presence_merged_its.rds"),
+    merge_log  = file.path(GOS_TMP, "presence_species_merge_log_its.csv"),
+    nhost_rds  = file.path(GOS_TMP, sprintf("nhost_null_its_iter%d.rds", N_ITER)),
+    mpd_rds    = file.path(GOS_TMP, sprintf("mpd_null_its_rep%d.rds", N_REP)),
+    info_csv   = file.path(GOS_TAB, "gos_per_asv_info_its.txt"),
+    classified = file.path(GOS_TAB, "gos_classified_its.txt"),
+    threshold  = file.path(GOS_TMP, "gos_threshold_its.rds"),
+    gen_fa     = file.path(GOS_TAB, "gos_generalist_ref_its.fa"),
+    gen_tax    = file.path(GOS_TAB, "gos_generalist_taxonomy_its.txt"),
+    spe_fa     = file.path(GOS_TAB, "gos_specialist_ref_its.fa"),
+    spe_tax    = file.path(GOS_TAB, "gos_specialist_taxonomy_its.txt")
+  )
+)
+
+# Step 0：宿主距离矩阵（已存在则跳过）
+gos_host_dist(HOST_TREE, HOST_DIST_RDS)
+```
+
+## 8.1 Step 1 — 0-1 矩阵提取与合并
+
+```{r gos-1-merge-16s}
+mg_16s <- gos_presence_merge(
+  css_file = GOS_CFG$`16s`$css, meta_file = GOS_CFG$`16s`$meta,
+  ref_fa = GOS_CFG$`16s`$ref, host_dist_rds = HOST_DIST_RDS,
+  out_merged_txt = GOS_CFG$`16s`$merged_txt,
+  out_log_csv = GOS_CFG$`16s`$merge_log,
+  out_rds = GOS_CFG$`16s`$merged_rds, ds = "16s")
+```
+
+```{r gos-1-merge-its}
+mg_its <- gos_presence_merge(
+  css_file = GOS_CFG$its$css, meta_file = GOS_CFG$its$meta,
+  ref_fa = GOS_CFG$its$ref, host_dist_rds = HOST_DIST_RDS,
+  out_merged_txt = GOS_CFG$its$merged_txt,
+  out_log_csv = GOS_CFG$its$merge_log,
+  out_rds = GOS_CFG$its$merged_rds, ds = "its")
+```
+
+合并日志摘要（每物种样本数 / 正态性 p / 代表物种数 T）：
+
+```{r gos-1-merge-log}
+merge_log16 <- read.csv(GOS_CFG$`16s`$merge_log)
+merge_logit <- read.csv(GOS_CFG$its$merge_log)
+log_summary <- rbind(
+  data.frame(dataset = "16S", n_species = nrow(merge_log16),
+             n_asv = mg_16s$n_asv, n_sample = mg_16s$n_samples,
+             rep_T_median = median(merge_log16$rep_T)),
+  data.frame(dataset = "ITS", n_species = nrow(merge_logit),
+             n_asv = mg_its$n_asv, n_sample = mg_its$n_samples,
+             rep_T_median = median(merge_logit$rep_T)))
+knitr::kable(log_summary, caption = "合并概况：宿主物种数 / 映射 ASV 数 / 样本数 / 代表物种数 T 中位",
+             digits = 1)
+```
+
+## 8.2 Step 2 — n_hosts 实际/零分布 + 通才阈值
+
+```{r gos-2-null-16s}
+nnull_16s <- gos_nhost_null(merged_rds = GOS_CFG$`16s`$merged_rds,
+                            out_rds = GOS_CFG$`16s`$nhost_rds,
+                            n_iter = N_ITER, seed = 20260813)
+thr_16s  <- gos_nhost_threshold(nnull_16s, ds = "16s")
+saveRDS(thr_16s, GOS_CFG$`16s`$threshold)
+```
+
+```{r gos-2-null-its}
+nnull_its <- gos_nhost_null(merged_rds = GOS_CFG$its$merged_rds,
+                            out_rds = GOS_CFG$its$nhost_rds,
+                            n_iter = N_ITER, seed = 20260813)
+thr_its  <- gos_nhost_threshold(nnull_its, ds = "its")
+saveRDS(thr_its, GOS_CFG$its$threshold)
+```
+
+阈值结果：
+
+```{r gos-2-threshold-table}
+thr_df <- rbind(
+  data.frame(dataset = "16S", threshold = thr_16s$threshold,
+             method = thr_16s$method,
+             n_candidate = thr_16s$n_generalist_candidate,
+             null_q95 = round(thr_16s$null_q95, 1)),
+  data.frame(dataset = "ITS", threshold = thr_its$threshold,
+             method = thr_its$method,
+             n_candidate = thr_its$n_generalist_candidate,
+             null_q95 = round(thr_its$null_q95, 1)))
+knitr::kable(thr_df, caption = "n_hosts 通才阈值（实际分布首次大于零分布 crossing 法 / 退化时退回零分布 95% 分位）", digits = 1)
+```
+
+n_hosts 实际分布 vs 零分布对比图（虚线 = 通才阈值，x 轴截断到 0~50，y 轴 log10 缩放）：
+
+```{r gos-2-plot}
+p_nhost_l10 <- gos_plot_nhost(
+  nnull_16s, nnull_its, thr_16s$threshold, thr_its$threshold,
+  y_scale = "log10", x_max = 50,
+  file.path(GOS_FIG, "gos_nhost_distribution.pdf"),
+  file.path(GOS_FIG, "gos_nhost_distribution.jpg"))
+
+p_nhost_l10
+```
+
+## 8.3 Step 3 — z 值 + 显著性（基于宿主发育距离的每-n_hosts 零模型）
+
+```{r gos-3-mpd-16s}
+gos_mpd_null(merged_rds = GOS_CFG$`16s`$merged_rds, host_dist_rds = HOST_DIST_RDS,
+             out_rds = GOS_CFG$`16s`$mpd_rds, n_rep = N_REP, seed = 20260813)
+z16 <- gos_z_scores(merged_rds = GOS_CFG$`16s`$merged_rds, host_dist_rds = HOST_DIST_RDS,
+                    mpd_null_rds = GOS_CFG$`16s`$mpd_rds,
+                    out_csv = GOS_CFG$`16s`$info_csv, ds = "16s")
+```
+
+```{r gos-3-mpd-its}
+gos_mpd_null(merged_rds = GOS_CFG$its$merged_rds, host_dist_rds = HOST_DIST_RDS,
+             out_rds = GOS_CFG$its$mpd_rds, n_rep = N_REP, seed = 20260813)
+zit <- gos_z_scores(merged_rds = GOS_CFG$its$merged_rds, host_dist_rds = HOST_DIST_RDS,
+                    mpd_null_rds = GOS_CFG$its$mpd_rds,
+                    out_csv = GOS_CFG$its$info_csv, ds = "its")
+```
+
+每 ASV 完整信息表（ASV_ID, n_hosts, mean_dist, null_mu, null_sd, z, p_disp, p_clus, q_disp, q_clus）已保存到 `result/GOS/result_table/`。显著性汇总：
+
+```{r gos-3-summary}
+z_sum <- rbind(
+  data.frame(dataset = "16S", n_asv = nrow(z16), n_hosts_ge2 = sum(z16$n_hosts >= 2),
+             sig_disp_q005 = sum(z16$q_disp < 0.05, na.rm = TRUE),
+             sig_clus_q005 = sum(z16$q_clus < 0.05, na.rm = TRUE),
+             cor_nh_z = round(cor(z16$n_hosts, z16$z, use = "complete.obs"), 3)),
+  data.frame(dataset = "ITS", n_asv = nrow(zit), n_hosts_ge2 = sum(zit$n_hosts >= 2),
+             sig_disp_q005 = sum(zit$q_disp < 0.05, na.rm = TRUE),
+             sig_clus_q005 = sum(zit$q_clus < 0.05, na.rm = TRUE),
+             cor_nh_z = round(cor(zit$n_hosts, zit$z, use = "complete.obs"), 3)))
+knitr::kable(z_sum, caption = "z 值显著性汇总（BH-FDR q<0.05；cor(n_hosts, z) 示两轴独立性）", digits = 3)
+```
+
+## 8.4 Step 4 — 分类 + 参考序列 / 物种注释提取
+
+```{r gos-4-classify-16s}
+cl16 <- gos_classify(z16, threshold = thr_16s$threshold, alpha = ALPHA)
+data.table::fwrite(cl16, GOS_CFG$`16s`$classified, sep = "\t")
+table(cl16$category)
+```
+
+```{r gos-4-classify-its}
+clit <- gos_classify(zit, threshold = thr_its$threshold, alpha = ALPHA)
+data.table::fwrite(clit, GOS_CFG$its$classified, sep = "\t")
+table(clit$category)
+```
+
+```{r gos-4-extract-16s}
+gen16 <- cl16$ASV_ID[cl16$category == "generalist"]
+spe16 <- cl16$ASV_ID[cl16$category == "specialist"]
+if (length(gen16) > 0) {
+  gos_extract_fasta(gen16, GOS_CFG$`16s`$ref, GOS_CFG$`16s`$gen_fa)
+  gos_extract_tax(gen16, GOS_CFG$`16s`$tax, GOS_CFG$`16s`$gen_tax)
+}
+if (length(spe16) > 0) {
+  gos_extract_fasta(spe16, GOS_CFG$`16s`$ref, GOS_CFG$`16s`$spe_fa)
+  gos_extract_tax(spe16, GOS_CFG$`16s`$tax, GOS_CFG$`16s`$spe_tax)
+}
+```
+
+```{r gos-4-extract-its}
+genit <- clit$ASV_ID[clit$category == "generalist"]
+speit <- clit$ASV_ID[clit$category == "specialist"]
+if (length(genit) > 0) {
+  gos_extract_fasta(genit, GOS_CFG$its$ref, GOS_CFG$its$gen_fa)
+  gos_extract_tax(genit, GOS_CFG$its$tax, GOS_CFG$its$gen_tax)
+}
+if (length(speit) > 0) {
+  gos_extract_fasta(speit, GOS_CFG$its$ref, GOS_CFG$its$spe_fa)
+  gos_extract_tax(speit, GOS_CFG$its$tax, GOS_CFG$its$spe_tax)
+}
+```
+
+宿主系统发育分散属性汇总（`dispersed` = 显著分散 / `clustered` = 显著聚集 / `neutral` = 中性；`generalist_*` 列为通才内部该属性计数）：
+
+```{r gos-4-dispersion}
+disp_sum <- rbind(
+  data.frame(dataset = "16S",
+             dispersed = sum(cl16$dispersion == "dispersed", na.rm = TRUE),
+             clustered = sum(cl16$dispersion == "clustered", na.rm = TRUE),
+             neutral   = sum(cl16$dispersion == "neutral",   na.rm = TRUE),
+             generalist_dispersed = sum(cl16$category == "generalist" & cl16$dispersion == "dispersed"),
+             generalist_clustered = sum(cl16$category == "generalist" & cl16$dispersion == "clustered"),
+             generalist_neutral   = sum(cl16$category == "generalist" & cl16$dispersion == "neutral")),
+  data.frame(dataset = "ITS",
+             dispersed = sum(clit$dispersion == "dispersed", na.rm = TRUE),
+             clustered = sum(clit$dispersion == "clustered", na.rm = TRUE),
+             neutral   = sum(clit$dispersion == "neutral",   na.rm = TRUE),
+             generalist_dispersed = sum(clit$category == "generalist" & clit$dispersion == "dispersed"),
+             generalist_clustered = sum(clit$category == "generalist" & clit$dispersion == "clustered"),
+             generalist_neutral   = sum(clit$category == "generalist" & clit$dispersion == "neutral")))
+knitr::kable(disp_sum, caption = "宿主系统发育分散属性汇总（通才内 generalist_clustered 应为 0，作一致性校验）")
+```
+
+通才 / 专才计数汇总：
+
+```{r gos-4-summary}
+cl_sum <- rbind(
+  data.frame(dataset = "16S",
+             generalist = sum(cl16$category == "generalist"),
+             specialist = sum(cl16$category == "specialist"),
+             intermediate = sum(cl16$category == "intermediate"),
+             absent = sum(cl16$category == "absent")),
+  data.frame(dataset = "ITS",
+             generalist = sum(clit$category == "generalist"),
+             specialist = sum(clit$category == "specialist"),
+             intermediate = sum(clit$category == "intermediate"),
+             absent = sum(clit$category == "absent")))
+knitr::kable(cl_sum, caption = "通才/专才分类计数（通才 = n_hosts ≥ 阈值 且 q_clus ≥ 0.05；专才 = n_hosts = 1）")
+```
+
+## 8.5 通才/专才分类群组成差异（Genus~Class 双向柱状图）
+
+对 16S（细菌）与 ITS（真菌）各自提取的通才/专才 ASV 分类注释，在 Class 与 Genus 层级
+统计每个分类群在通才/专才中的 **ASV 占比**（占各自总 ASV 数 %），并做
+**Fisher 精确检验**（通才 vs 专才 2×2）+ **BH-FDR** 校正（图上 `*` = FDR < 0.05）。
+双向柱状图右侧橙色 = 通才占比、左侧蓝色 = 专才占比；分类群按
+**通才/专才占比倍数 fold = %通才/%专才** 排序 → 顶部为通才富集倍数最高、
+底部为专才富集倍数最高；通才柱末端标注相对专才的倍数（专才占比 = 0 → `∞`）。
+2×2 拼图：**行 = 16S（上）/ ITS（下），列 = Genus（左）/ Class（右）**。
+每个层级的入选分类群 = **通才按组内 ASV 数取 Top-n（Genus 20 / Class 12）∪ 专才按组内 ASV 数取
+Top-n（Genus 20 / Class 12）的并集去重**，去重后有几个画几个、不保证总数；
+同一分类群两侧同画。无效注释（`Unassigned`/`Incertae Sedis`/空）不计入排名，
+占比单列 coverage 表供报告。配色沿用 §6.1 PAL1（Generalist 橙 `#D35400`，Specialist 蓝 `#547FB6`）。
+
+```{r gos-6-composition, fig.width = 13, fig.height = 12, out.width = "100%"}
+p_gos_comp <- gos_composition(
+  gen_tax_files = list(`16s` = GOS_CFG$`16s`$gen_tax, its = GOS_CFG$its$gen_tax),
+  spe_tax_files = list(`16s` = GOS_CFG$`16s`$spe_tax, its = GOS_CFG$its$spe_tax),
+  datasets = c(`16s` = "16S (Bacteria)", its = "ITS (Fungi)"),
+  out_table     = file.path(GOS_TAB, "gos_composition.tsv"),
+  out_coverage  = file.path(GOS_TAB, "gos_composition_coverage.tsv"),
+  out_fig_base  = file.path(GOS_FIG, "fig_gos_comp_diverging"))
+p_gos_comp
+```
+
+关键统计（全分类群×层级，含 fold_GS / OR / p / FDR）与 coverage 已写入上述表文件；
+Genus 层 Top 统计摘要见脚本控制台输出。
+
+## 8.6 通才/专才丰度–宿主数回归曲线（16S/ITS Top 4 组合拼图）
+
+对 16S（Phylum）与 ITS（Class）各自 ASV 数最多的 Top 4 类群，绘制类群内每个 ASV 的
+n_hosts（宿主物种数）与相对丰度（log10）散点，叠加线性回归与 95% 置信带。
+上层 = 16S Top 4 Phylum，下层 = ITS Top 4 Class，行内按 ASV 数降序排列。
+8 个面板共享全局颜色标尺（log10 相对丰度，红高蓝低）与底部颜色/形状图例；
+面板内不显示坐标轴 title（共享 y/x title 分别放最左竖排与底部）。
+
+```{r gos-5-abund-top4, fig.width = 23.2, fig.height = 11.1, out.width = "100%"}
+# 数据 + 排序（ASV 数量降序，取 Top 4）
+d16 <- gos_nhost_abund_data(
+  css_file = GOS_CFG$`16s`$css, classified_file = GOS_CFG$`16s`$classified,
+  tax_file = GOS_CFG$`16s`$tax, meta_file = GOS_CFG$`16s`$meta,
+  group_col = "Phylum")
+s16 <- gos_nhost_abund_rank(d16, top = 4L)
+
+dits <- gos_nhost_abund_data(
+  css_file = GOS_CFG$its$css, classified_file = GOS_CFG$its$classified,
+  tax_file = GOS_CFG$its$tax, meta_file = GOS_CFG$its$meta,
+  group_col = "Class")
+sits <- gos_nhost_abund_rank(dits, top = 4L)
+
+# 全局共享颜色标尺（覆盖两层全部面板，上限固定 0）
+color_limits <- c(min(d16[grp %in% s16$grp]$log10_rel,
+                      dits[grp %in% sits$grp]$log10_rel), 0)
+
+# 8 个面板 grob（legend="none"，面板内不显示坐标轴 title）
+panel16 <- lapply(seq_len(nrow(s16)), function(i) {
+  p <- gos_nhost_abund_subplot(d16[grp == s16$grp[i]], s16$grp[i], s16[i],
+                               color_limits = color_limits, legend = "none",
+                               show_axis_titles = FALSE)
+  gos_nhost_abund_banner(p, s16$grp[i])
+})
+panelits <- lapply(seq_len(nrow(sits)), function(i) {
+  p <- gos_nhost_abund_subplot(dits[grp == sits$grp[i]], sits$grp[i], sits[i],
+                               color_limits = color_limits, legend = "none",
+                               show_axis_titles = FALSE)
+  gos_nhost_abund_banner(p, sits$grp[i])
+})
+
+# 共享图例（颜色 + 形状，水平排布，从 16S 首面板提取）
+p_leg <- gos_nhost_abund_subplot(d16[grp == s16$grp[1L]], s16$grp[1L], s16[1L],
+                                 color_limits = color_limits, legend = "bottom",
+                                 show_axis_titles = FALSE)
+legend_grob <- gos_nhost_abund_legend(p_leg)
+
+# 共享坐标轴 title + 层标签
+ytitle <- grid::textGrob("log10(relative abundance)", rot = 90,
+                         gp = grid::gpar(fontface = "bold", fontsize = 13))
+xtitle <- grid::textGrob("n_hosts",
+                         gp = grid::gpar(fontface = "bold", fontsize = 13))
+make_row_label <- function(txt)
+  grid::textGrob(txt, rot = 90,
+                 gp = grid::gpar(fontface = "bold", fontsize = 12))
+
+# 单次 arrangeGrob + layout_matrix
+#   列： ytitle | 层标签 | 4 个面板（16S 行 / ITS 行）
+#   行： 16S 行 | ITS 行 | 共享 x title | 共享图例
+#   注意：全部用位置参数（顺序即矩阵编号），勿用显式 grobs= 参数
+#         （gridExtra 会把显式 grobs= 排在前面，导致列序错位）
+panel_w <- 5.2; panel_h <- 4.6
+full <- gridExtra::arrangeGrob(
+  ytitle, make_row_label("16S · Phylum"), make_row_label("ITS · Class"),
+  panel16[[1]], panel16[[2]], panel16[[3]], panel16[[4]],
+  panelits[[1]], panelits[[2]], panelits[[3]], panelits[[4]],
+  xtitle, legend_grob,
+  layout_matrix = rbind(
+    c(1, 2, 4, 5, 6, 7),
+    c(1, 3, 8, 9, 10, 11),
+    c(NA, NA, 12, 12, 12, 12),
+    c(NA, NA, 13, 13, 13, 13)
+  ),
+  widths  = c(1.2, 1.2, rep(panel_w, 4)),
+  heights = c(panel_h, panel_h, 1.0, 0.9)
+)
+
+# 保存 PDF + JPG
+out_base <- file.path(GOS_FIG, "nhost_abund_curves",
+                      "nhost_abund_curves_top4_combined")
+dir.create(dirname(out_base), recursive = TRUE, showWarnings = FALSE)
+W_out <- 1.2 + 1.2 + 4 * panel_w
+H_out <- 2 * panel_h + 1.0 + 0.9
+ggplot2::ggsave(paste0(out_base, ".pdf"), full, width = W_out, height = H_out,
+                device = cairo_pdf, limitsize = FALSE)
+ggplot2::ggsave(paste0(out_base, ".jpg"), full, width = W_out, height = H_out,
+                dpi = 300, device = "jpeg", limitsize = FALSE)
+
+full
+```
+
+**输出文件清单**（均在 `result/GOS/`）：
+- `result_table/presence_merged_{16s,its}.txt` — 合并 0-1 矩阵
+- `result_table/gos_per_asv_info_{16s,its}.txt` — 每 ASV 完整信息表（n_hosts / mean_dist / z / FDR 等）
+- `result_table/gos_classified_{16s,its}.txt` — 分类结果（含 category 与 dispersion 属性列）
+- `result_table/gos_generalist_ref_{16s,its}.fa` + `gos_generalist_taxonomy_{16s,its}.txt` — 通才参考序列与注释
+- `result_table/gos_specialist_ref_{16s,its}.fa` + `gos_specialist_taxonomy_{16s,its}.txt` — 专才参考序列与注释
+- `result_figure/gos_nhost_distribution.{pdf,jpg}` — n_hosts 实际 vs 零分布对比图（阈值虚线，y=log10，x 轴截断 0~50）
+- `result_figure/nhost_abund_curves/nhost_abund_curves_top4_combined.{pdf,jpg}` — 16S/ITS Top4 丰度–宿主数回归组合拼图（上 16S Phylum / 下 ITS Class，共享颜色标尺与图例）
+- `result_table/gos_composition.tsv` — 通才/专才分类群组成统计（全分类群×层级，fold_GS / OR / p / FDR）
+- `result_table/gos_composition_coverage.tsv` — 无效注释（Unassigned/Incertae Sedis）占比（供报告）
+- `result_figure/fig_gos_comp_diverging.{pdf,jpg}` — 通才/专才分类群组成双向柱状拼图（§8.5，行 16S/ITS、列 Genus/Class）
+- `Temp_data/` — 中间 RDS（合并 / 零分布 / 零模型 / 阈值）与日志
+
+
+## 8.7 对细菌通才和专才代表序列建树
+```{bash}
+#简简单单跑个树
+cd /mnt/d/seed_meta_new/Downstream_analysis/result/GOS/result_table
+mkdir -p iqtree
+muscle -align gos_generalist_ref_16s.fa -output iqtree/tree_g_16s_muscle.fa
+trimal -in iqtree/tree_g_16s_muscle.fa \
+  -out iqtree/tree_g_16s_muscle_trimmed.fa \
+  -automated1
+iqtree3 \
+  -s iqtree/tree_g_16s_muscle_trimmed.fa \
+  -m MFP \
+  -B 1000 \
+  -T 8 \
+  --prefix iqtree/tree_g_16s
+
+mafft --auto --thread 100 gos_specialist_ref_16s.fa > tree_s_16s_mafft.fa
+trimal -in tree_s_16s_mafft.fa \
+  -out tree_s_16s_mafft_trimmed.fa \
+  -automated1
+FastTreeMP -nt -gtr -gamma tree_s_16s_mafft_trimmed.fa > tree_s_16s_FastTree.tree
+```
+
+## 8.8 dispersed / clustered ASV 宿主分布热图
+
+§8.4 分类输出中，每个 ASV（n_hosts ≥ 2）附加了 `dispersion` 属性：宿主平均遗传距离
+**显著低于**随机预测（q_clus < 0.05）记为 `clustered`（异常聚集 → 取消通才资格），
+**显著高于**预测（q_disp < 0.05）记为 `dispersed`。本节用一张热图展示全部 clustered /
+dispersed ASV（n_hosts ≥ 1）在宿主之间的实际存在分布，并输出 clustered ASV 的
+物种注释与代表宿主属：
+
+- **矩阵**：176 宿主 species（行，按 `plant_species_tree_all.nwk` 系统发育顺序）× 全部
+  选中 ASV（列）；C/D×B/F 四组（C_B / D_B / C_F / D_F）**分别聚类**（存在/不存在二元
+  模式，complete），组间留缝。**块 = 存在时按 log2(n_hosts) 赋色**（n_hosts 越高颜色越深），
+  不存在/未测 = 白。
+- **色带**：顶部 = C/D×B/F 4 色（C_B 深蓝 `#1B6CA8` / D_B 浅蓝 `#7FBFDF` /
+  C_F 深绿 `#238B45` / D_F 浅绿 `#8FD4A8`）；右侧 = 宿主 **Order** 颜色
+  （`result/Host_Seed_microbiota/rds/color_map_flat.rds` 的 `order` 向量）。
+- **列标签隐藏**（ASV 数过多不可读）；具体 ASV ↔ 组/宿主对应关系查
+  `result_table/gos_dispersion_selected.tsv` + `result_table/gos_clustered_taxonomy_repr.tsv`。
+- **重命名**：`{C|D}_{B|F}_{N}_ASV{seq}`（C/D = clustered/dispersed，B/F = 16S/ITS，
+  N = n_hosts，seq = 组内顺序号）。
+- **Repres_genus / Repres_N**：clustered ASV 出现的宿主 species 按宿主 Genus 计数，
+  出现次数最多的 Genus（并列 `;` 连接）/ 对应出现次数。
+
+```{r gos-7-disp-run}
+gos_dispersion_heatmap(
+  classified_files = list(B = GOS_CFG$`16s`$classified, F = GOS_CFG$its$classified),
+  presence_files   = list(B = GOS_CFG$`16s`$merged_txt, F = GOS_CFG$its$merged_txt),
+  tax_files        = list(B = "filtered_merge/16S/Merged_16S_taxonomy_filtered.txt",
+                          F = "filtered_merge/ITS/Merged_ITS_taxonomy_filtered.txt"),
+  meta_files       = list(B = GOS_CFG$`16s`$meta, F = GOS_CFG$its$meta),
+  tree_file        = HOST_TREE,
+  color_map_rds    = "result/Host_Seed_microbiota/rds/color_map_flat.rds",
+  out_selected     = file.path(GOS_TAB, "gos_dispersion_selected.tsv"),
+  out_taxonomy     = file.path(GOS_TAB, "gos_clustered_taxonomy_repr.tsv"),
+  out_fig_base     = file.path(GOS_FIG, "fig_dispersion_heatmap"))
+```
+
+选中概况（16S 75 clustered + 237 dispersed / ITS 53 clustered + 18 dispersed，共 383 ASV）：
+
+```{r gos-7-disp-tab-map}
+disp_map <- data.table::fread(file.path(GOS_TAB, "gos_dispersion_selected.tsv"))
+disp_map_sum <- disp_map[, .(n_asv = .N), by = .(grp, db)][order(grp, db)]
+knitr::kable(disp_map_sum,
+             caption = "选中 ASV 分组计数（grp：C = clustered / D = dispersed；db：B = 16S / F = ITS）")
+```
+
+clustered ASV 的物种注释与代表宿主属（完整表 `gos_clustered_taxonomy_repr.tsv`，
+128 行）：下表为每个数据集出现次数最多的前 5 个 Repres_genus（并列多属以 `;` 连接计为一项）：
+
+```{r gos-7-disp-tab-tax}
+disp_tax <- data.table::fread(file.path(GOS_TAB, "gos_clustered_taxonomy_repr.tsv"))
+disp_tax[, db := substr(new_name, 3, 3)]   # new_name 形如 C_B_0048_ASV0001，第 3 位 = B/F
+disp_tax_top <- disp_tax[, .(n = .N), by = .(db, Repres_genus)][order(db, -n)][, head(.SD, 5), by = db]
+knitr::kable(disp_tax_top,
+             caption = "clustered ASV 的代表宿主属 Top5（按 clustered ASV 计数）")
+```
+
+热图（176 宿主 × 383 ASV；顶部色带 = C/D×B/F 4 色、右侧色带 = 宿主 Order，列标签隐藏）：
+
+```{r gos-7-disp-fig, out.width = "100%"}
+if (file.exists(file.path(GOS_FIG, "fig_dispersion_heatmap.jpg")))
+  knitr::include_graphics(file.path(GOS_FIG, "fig_dispersion_heatmap.jpg"))
+```
+
+**输出文件清单**（均在 `result/GOS/`）：
+- `result_table/gos_dispersion_selected.tsv` — 选中 ASV 重命名映射（ASV_ID ↔ new_name + grp/db/n_hosts/dispersion，383 行）
+- `result_table/gos_clustered_taxonomy_repr.tsv` — clustered ASV 物种注释 + Repres_genus / Repres_N（128 行）
+- `result_figure/fig_dispersion_heatmap.{pdf,jpg}` — dispersed/clustered ASV 宿主分布热图
+
+
+# 9.对映射到参考序列的ASV进行功能预测（仅对n_host>0的ASV进行了预测）
+对于16S序列，将使用picrust2，bugbase，faprotax，metatrait来进行预测
+对于ITS序列将使用funguild来进行预测
+
+#picrust2
+```{r}
+#先建立功能预测文件夹
+source("scripts/R/Tools.R")
+library(Biostrings)
+dir.create("Function_prediction")
+#整理picrust2输入数据
+dir.create("Function_prediction/picrust2")
+#提取目标序列
+gos_per_asv_info_16s <- read.delim("result/GOS/result_table/gos_per_asv_info_16s.txt")
+target_seq <- gos_per_astarget_seq <- gos_per_astarget_seq <- gos_per_asv_info_16s$ASV_ID[gos_per_asv_info_16s$n_hosts!=0]
+all_sequences <- readDNAStringSet("filtered_merge/16S/Merged_16S_Silva_filtered.fa")
+get_target_seq(target_seq,all_sequences,"Function_prediction/picrust2/target_seq_16s.fa")
+#构建伪丰度表
+pseudo_otutab_16s <- data.frame(
+  OTUID = target_seq,
+  sample = 1
+)
+colnames(pseudo_otutab_16s)[1] <- "#OTUID"
+write.table(pseudo_otutab_16s,file = "Function_prediction/picrust2/pseudo_otutab_16s.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+#接下来转服务器运行
+#建立一个名为picrust2的文件夹，放置两个文件
+# picrust2_pipeline.py -s target_seq_16s.fa -i pseudo_otutab_16s.txt -o ./picrust2_result -p 150 --max_nsti 0.15
+# 将服务器结果同步到本地Function_prediction/picrust2/picrust2_result中
+
+#将picrust结果转化为标准格式
+library(data.table)
+library(tibble)
+nsti_df <- read.delim("Function_prediction/picrust2/picrust2_result/combined_marker_predicted_and_nsti.tsv")
+ko_data <- fread("Function_prediction/picrust2/picrust2_result/combined_KO_predicted.tsv")
+ko_data <- column_to_rownames(ko_data,var = colnames(ko_data)[1])
+#筛选数据
+ko_data = ko_data[nsti_df$sequence[nsti_df$metadata_NSTI <= 0.15],]
+colnames(ko_data) = gsub("ko.","",colnames(ko_data))
+ko_data = rownames_to_column(ko_data,"taxid")
+write.table(ko_data,file = "Function_prediction/picrust2/ko_data_nsti_filtered.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+```
+
+#faprotax
+```{r}
+#制作FAPROTAX输入文件(需要映射到silva132注释)
+dir.create("Function_prediction/faprotax")
+library(biomformat)
+library(tibble)
+library(dplyr)
+taxonomy_16s_target <- read.delim("filtered_merge/16S/Merged_16S_taxonomy_filtered.txt")
+# taxonomy_16s_target <- taxonomy_16s_all[taxonomy_16s_all$taxid%in%target_seq,]
+silva_tax_132 = read.delim("db/SILVA_132_taxonomy.txt")
+taxonomy_16s_132 = silva_tax_132[silva_tax_132$taxid %in% c(taxonomy_16s_target$taxid),]
+
+prefixes <- c("k__", "p__", "c__", "o__", "f__", "g__", "s__")
+tax_levels <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+#定义函数：处理单行分类信息，添加前缀并合并非NA值
+process_taxonomy <- function(row) {
+  # 提取当前行的分类信息
+  tax_info <- row[tax_levels]
+  # 筛选非NA值，并为其添加对应前缀
+  non_na_idx <- !is.na(tax_info)
+  if (sum(non_na_idx) == 0) {
+    return("")  # 若全为NA，返回空字符串（可根据需求调整）
+  }
+  # 拼接前缀和分类名，并用分号分隔
+  paste0(prefixes[non_na_idx], tax_info[non_na_idx], collapse = ";")
+}
+
+# 3. 对数据框按行应用函数，生成合并后的分类字符串
+taxonomy_132_faprotax <- taxonomy_16s_132 %>%
+  rowwise() %>%  # 按行处理
+  mutate(taxonomy = process_taxonomy(pick(all_of(tax_levels)))) %>%  # 生成合并列
+  ungroup() %>%  # 取消按行分组
+  select("taxid","taxonomy")
+write.table(taxonomy_132_faprotax,file = "Function_prediction/faprotax/taxonomy_132_faprotax.txt",
+            sep = "\t", row.names = FALSE,col.names = FALSE,quote = FALSE,fileEncoding = "UTF-8")
+otutab = data.frame(taxid = taxonomy_16s_132$taxid ,sample1 = 1,sample2 = 1,sample3 = 1)
+colnames(otutab)[1] = "#OTUID"
+write.table(otutab,file = "Function_prediction/faprotax/otutab.txt",
+            sep = "\t", row.names = FALSE,col.names = TRUE,quote = FALSE,fileEncoding = "UTF-8")
+metadata <- data.frame(
+  row.names = c("sample1", "sample2", "sample3"),
+  group1 = c("Soil", "Water", "Water"),
+  group2 = c("a", "b", "b")
+)
+write.table(metadata,file = "Function_prediction/faprotax/metadata.txt",
+            sep = "\t", row.names = FALSE,col.names = TRUE,quote = FALSE,fileEncoding = "UTF-8")
+#############################################
+cd /mnt/d/seed_meta_new/Downstream_analysis/Function_prediction/faprotax
+conda deactivate
+conda activate qiime2-amplicon-2025.10
+biom convert -i otutab.txt -o otutab_rare.biom --table-type="OTU table" --to-json
+biom add-metadata -i otutab_rare.biom --observation-metadata-fp taxonomy_132_faprotax.txt \
+-o otutab_rare_tax.biom --sc-separated taxonomy \
+--observation-header OTUID,taxonomy
+conda deactivate
+conda activate faprotax
+python ../../db/FAPROTAX_1.2.12/collapse_table.py -i otutab_rare_tax.biom \
+-g ../../db/FAPROTAX_1.2.12/FAPROTAX.txt \
+--collapse_by_metadata 'taxonomy' -v --force \
+-o faprotax.txt -r faprotax_report.txt
+#清理输出文件
+txt_file="faprotax_report.txt"
+target_str="# Detailed group assignments are listed below"
+line_num=$(grep -n "^${target_str}$" "${txt_file}" | cut -d: -f1)
+if [ -z "${line_num}" ]; then
+echo "错误：未在文件 ${txt_file} 中找到目标字符串：${target_str}"
+exit 1
+fi
+start_line=$((line_num + 2))
+echo "===== 保留的文件内容如下（从第 ${start_line} 行开始）====="
+sed -n "${start_line},\$p" "${txt_file}" > faprotax_report.clean
+#使用perl脚本制作输出矩阵文件
+perl ../../db/faprotax_report_sum.pl -i faprotax_report.clean -o faprotax_report
+#############################################
+faprotax_result <- read.table("Function_prediction/faprotax/faprotax_report.mat", header=TRUE, row.names=1, sep="\t")[-1,]
+faprotax_result[faprotax_result == "0"] <- "FALSE"
+faprotax_result[faprotax_result == "1"] <- "TRUE"
+faprotax_result = rownames_to_column(faprotax_result,"taxid")
+write.table(faprotax_result,file = "Function_prediction/faprotax/faprotax_result.txt",
+            sep = "\t", row.names = FALSE,col.names = TRUE,quote = FALSE,fileEncoding = "UTF-8")
+```
+
+#bugbase
+```{r}
+dir.create("Function_prediction/bugbase")
+file.copy("filtered_merge/16S/Merged_16S_Silva_filtered.fa","Function_prediction/bugbase/mapped_seq_16s.fa")
+############################################
+wd=/d/seed_meta_new/Downstream_analysis/Function_prediction/bugbase
+db=/e/EasyMicrobiome1
+PATH=$PATH:${db}/win
+cd ${wd}
+usearch2 -otutab mapped_seq_16s.fa -otus ../../db/97_otus.fasta \
+-otutabout otutab_gg.txt -threads 16
+############################################
+#制作bugbase输入文件
+otutab_gg = read.delim("Function_prediction/bugbase/otutab_gg.txt",row.names = 1)
+taxid_gg <- data.frame(
+  taxid = names(otutab_gg),
+  ggid = sapply(otutab_gg, function(x) rownames(otutab_gg)[which.max(x)])
+)
+otutab_gg2 = data.frame(
+  Sample1=sample(2:10, size =length(rownames(otutab_gg)), replace = TRUE),
+  Sample2=sample(2:10, size =length(rownames(otutab_gg)), replace = TRUE),
+  Sample3=sample(2:10, size =length(rownames(otutab_gg)), replace = TRUE)
+)
+rownames(otutab_gg2)=rownames(otutab_gg)
+metadata_gg = data.frame(
+  SampleID = names(otutab_gg2),
+  Group = c("A", "B", "C")
+)
+otutab_gg2 = rownames_to_column(otutab_gg2,"#OTU ID")
+write.table(taxid_gg,file = "Function_prediction/bugbase/taxid_gg.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+write.table(otutab_gg2,file = "Function_prediction/bugbase/otutab_gg2.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+write.table(metadata_gg,file = "Function_prediction/bugbase/metadata_gg.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+########################################################
+#在bash环境下使用bugbase进行预测
+bugbase=${db}/script/BugBase
+rm -rf bugbase/
+Rscript ${bugbase}/bin/run.bugbase.r -L ${bugbase} \
+  -i otutab_gg2.txt -m metadata_gg.txt -c Group -o bugbase/
+#######################################################
+#bugbase运行完后将输出文件处理为目标格式
+taxid_gg = read.delim("Function_prediction/bugbase/taxid_gg.txt")
+bugbase_result = read.delim("Function_prediction/bugbase/bugbase/otu_contributions/contributing_otus.txt")
+names(bugbase_result)[1] = "ggid"
+bugbase_result = merge(taxid_gg,bugbase_result,by="ggid")
+write.table(bugbase_result,file = "Function_prediction/bugbase/bugbase_result.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+```
+
+
+# metaTraits
+```{r}
+dir.create("Function_prediction/metatraits")
+file.copy("filtered_merge/16S/Merged_16S_Silva_filtered.fa","Function_prediction/metatraits/mapped_seq_16s.fa")
+###################################################
+cd /mnt/d/seed_meta_new/Downstream_analysis/Function_prediction/metatraits
+#创建临时文件
+rm -rf blast_chunks blast_results_tmp
+mkdir -p blast_chunks
+mkdir -p blast_results_tmp
+#将全长序列文件分割为 10 条/个的小文件
+seqkit split mapped_seq_16s.fa -s 50 -O blast_chunks/
+#使用 GNU parallel 进行多线程比对
+ls blast_chunks/*.fa | parallel -j 256 --progress \
+    "blastn -query {} \
+            -db /mnt/f/huge_meta/Genome_download/gtdb_db/gtdb_16s_db \
+            -outfmt '6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore' \
+            -max_target_seqs 1 \
+            -num_threads 1 \
+            -out blast_results_tmp/{/.}.tsv"
+#合并所有的临时比对结果
+cat blast_results_tmp/*.tsv > blast_results_merged.tsv
+echo "比对完成！所有结果已合并至 blast_results_merged.tsv"
+#运行metatraits
+PYTHONIOENCODING=utf-8 python scripts/python/per_asv_trait_pipeline.py \
+    --blast Function_prediction/metatraits/blast_results_merged.tsv \
+    --outdir Function_prediction/metatraits/trait_annotation
+###################################################
+```
+
+#funguild
+```{r}
+###funguild功能预测
+dir.create("Function_prediction/funguild")
+taxonomy_its <- read.delim("filtered_merge/ITS/Merged_ITS_taxonomy_filtered.txt")
+# gos_per_asv_info_its <- read.delim("result/GOS/result_table/gos_per_asv_info_its.txt")
+# target_asv <- gos_per_asv_info_its$ASV_ID[gos_per_asv_info_its$n_hosts!=0]
+# taxonomy_its <- taxonomy_its_all[taxonomy_its_all$taxid%in%target_asv,]
+taxonomy_its[taxonomy_its == "unclassified"] <- NA
+taxonomy_its[taxonomy_its == "Unassigned"] <- NA
+taxonomy_its <- taxonomy_its[,1:8]
+names(taxonomy_its)[2] = "Kingdom"
+library(dplyr)
+prefixes <- c("k__", "p__", "c__", "o__", "f__", "g__", "s__")
+tax_levels <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+#定义函数：处理单行分类信息，添加前缀并合并非NA值
+process_taxonomy <- function(row) {
+  # 提取当前行的分类信息
+  tax_info <- row[tax_levels]
+  # 筛选非NA值，并为其添加对应前缀
+  non_na_idx <- !is.na(tax_info)
+  if (sum(non_na_idx) == 0) {
+    return("")  # 若全为NA，返回空字符串（可根据需求调整）
+  }
+  # 拼接前缀和分类名，并用分号分隔
+  paste0(prefixes[non_na_idx], tax_info[non_na_idx], collapse = ";")
+}
+
+# 3. 对数据框按行应用函数，生成合并后的分类字符串
+result_df <- taxonomy_its %>%
+  rowwise() %>%  # 按行处理
+  mutate(taxonomy = process_taxonomy(pick(all_of(tax_levels)))) %>%  # 生成合并列
+  ungroup()  # 取消按行分组
+
+# 4. 提取目标两列，形成结果数据框
+result_df <- result_df %>%
+  select(taxid, taxonomy)
+#构建funguild输入格式
+funguild_table <- result_df
+funguild_table$sample1 = 1
+funguild_table <- funguild_table[,c(1,3,2)]
+colnames(funguild_table)[1] <- "OTU_ID"
+write.table(funguild_table,file = "Function_prediction/funguild/funguild_table.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+#切换到Ubuntu开始预测，先得挂梯子=======================================
+cd /mnt/d/seed_meta_new/Downstream_analysis/Function_prediction/funguild
+# cd D:\seed_meta_new\Downstream_analysis\Function_prediction\funguild
+pip install requests
+wget https:/raw.githubusercontent.com/UMNFuN/FUNGuild/master/Guilds_v1.1.py
+python ../../scripts/python/Guilds_v1.1.py -otu funguild_table.txt -db fungi -m -u
+#=====================================================================
+#导入预测结果
+library(dplyr)
+library(stringr)
+funguild_result = read.delim("Function_prediction/funguild/funguild_table.guilds_matched.txt")[ ,c("OTU_ID","Confidence.Ranking","Guild","Trophic.Mode")]
+funguild_result <- funguild_result %>%
+  mutate(Guild = str_replace_all(Guild, "\\|", "")) %>% # 去掉所有竖线
+  mutate(Guild = str_trim(Guild)) # 去掉两端可能存在的空格
+#根据Confidence.Ranking列来决定数据保留（不保留的直接设置成na）
+#一般认为Possible是不可信的，当然可以选择不筛选
+table(funguild_result$Confidence.Ranking)
+funguild_result <- funguild_result[funguild_result$Confidence.Ranking!="Possible",]
+
+colnames(funguild_result)[1] <- "taxid"
+funguild_result = funguild_result[,c("taxid","Guild","Trophic.Mode")] 
+#拆分注释Guild列
+# 定义Guild列表
+mycorrhizal_guilds <- c("Ectomycorrhizal", "Arbuscular Mycorrhizal", "Ericoid Mycorrhizal", 
+                        "Orchid Mycorrhizal", "Endomycorrhizal")
+
+endophyte_guilds <- c("Endophyte", "Foliar Endophyte", "Clavicipitaceous Endophyte")
+
+pathogens_guilds <- c("Plant Pathogen", "Plant Parasite", "Bryophyte Parasite", "Algal Parasite")
+
+saprotrophs_guilds  <- c("Wood Saprotroph", "Dung Saprotroph", "Pollen Saprotroph", "Leaf Saprotroph",
+                         "Soil Saprotroph", "Plant Saprotroph", "Undefined Saprotroph")
+
+
+# 在merged_data中添加新列
+funguild_result <- funguild_result %>%
+  mutate(
+    Mycorrhizal = ifelse(
+      str_detect(Guild, paste(mycorrhizal_guilds, collapse = "|")), 
+      TRUE, FALSE
+    ),
+    Endophyte = ifelse(
+      str_detect(Guild, paste(endophyte_guilds, collapse = "|")), 
+      TRUE, FALSE
+    ),
+    Pathogens = ifelse(
+      str_detect(Guild, paste(pathogens_guilds, collapse = "|")), 
+      TRUE, FALSE
+    ),
+    Saprotrophs = ifelse(
+      str_detect(Guild, paste(saprotrophs_guilds, collapse = "|")), 
+      TRUE, FALSE
+    ),
+    Pathotroph = ifelse(
+      str_detect(Trophic.Mode, "Pathotroph"), 
+      TRUE, FALSE
+    ),
+    Saprotroph = ifelse(
+      str_detect(Trophic.Mode, "Saprotroph"), 
+      TRUE, FALSE
+    ),
+    Symbiotroph = ifelse(
+      str_detect(Trophic.Mode, "Symbiotroph"), 
+      TRUE, FALSE
+    )
+  )
+write.table(funguild_result,file = "Function_prediction/funguild/funguild_result.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+```
+
+
+#将多个功能预测进行整合
+```{r}
+library(tibble)
+library(data.table)
+library(tidyverse)
+library(dplyr)
+#导入分类表
+gos_classified_16s <- read.delim("result/GOS/result_table/gos_classified_16s.txt")
+target_seq <- gos_classified_16s$ASV_ID[gos_classified_16s$n_hosts!=0]
+taxonomy_16s_all <- read.delim("filtered_merge/16S/Merged_16S_taxonomy_filtered.txt")
+taxonomy_16s_target <- taxonomy_16s_all[taxonomy_16s_all$taxid%in%target_seq,]
+
+gos_classified_its <- read.delim("result/GOS/result_table/gos_classified_its.txt")
+target_seq <- gos_classified_its$ASV_ID[gos_classified_its$n_hosts!=0]
+taxonomy_its_all <- read.delim("filtered_merge/its/Merged_its_taxonomy_filtered.txt")
+taxonomy_its_target <- taxonomy_its_all[taxonomy_its_all$taxid%in%target_seq,]
+#导入功能预测结果
+#funguild
+funguild_result <- read.delim("Function_prediction/funguild/funguild_result.txt")
+
+#bugbase
+bugbase_result <- read.delim("Function_prediction/bugbase/bugbase_result.txt")
+bugbase_result = bugbase_result %>%
+  mutate(Aerobic_type = ifelse(Aerobic=="TRUE","Aerobic",ifelse(Anaerobic=="TRUE","Anaerobic",ifelse(Facultatively_Anaerobic=="TRUE","Facultatively_Anaerobic","Unknown")))) %>%
+  mutate(Gram_type = ifelse(Gram_Positive=="TRUE","Positive",ifelse(Gram_Negative=="TRUE","Negative","Unknown")))
+# bugbase_result = bugbase_result[,!colnames(bugbase_result)%in%c("Aerobic","Anaerobic","Facultatively_Anaerobic","Gram_Positive","Gram_Negative")]
+bugbase_result = column_to_rownames(bugbase_result,"taxid")
+colnames(bugbase_result) <- paste0("bugbase_", colnames(bugbase_result))
+
+#faprotax
+faprotax_result <- read.table("Function_prediction/faprotax/faprotax_report.mat", header=TRUE, row.names=1, sep="\t")[-1,]
+faprotax_result <- faprotax_result %>%
+  select(where(function(x) {
+    na_rate <- mean(is.na(x))
+    one_rate <- mean(x == 1, na.rm = TRUE)
+    na_rate < 0.5 && one_rate > 0.01
+  }))
+colnames(faprotax_result) <- paste0("faprotax_", colnames(faprotax_result))
+faprotax_result[faprotax_result == "0"] <- "FALSE"
+faprotax_result[faprotax_result == "1"] <- "TRUE"
+#metatraits
+metatraits_boolean <- read.delim("Function_prediction/metatraits/trait_annotation/asv_trait_matrix_clean_boolean.tsv",row.names = 1)
+metatraits_boolean <- metatraits_boolean %>%
+  select(where(function(x) {
+    na_rate <- mean(is.na(x))
+    one_rate <- mean(x == 1, na.rm = TRUE)
+    na_rate < 0.5 && one_rate > 0.05
+  }))
+colnames(metatraits_boolean) <- paste0("metatraits_", colnames(metatraits_boolean))
+metatraits_boolean[metatraits_boolean == "0"] <- "FALSE"
+metatraits_boolean[metatraits_boolean == "1"] <- "TRUE"
+metatraits_continuous <- read.delim("Function_prediction/metatraits/trait_annotation/asv_trait_matrix_clean_continuous.tsv",row.names = 1)
+metatraits_continuous <- metatraits_continuous %>%
+  select(where(~ mean(is.na(.)) < 0.5))
+colnames(metatraits_continuous) <- paste0("metatraits_", colnames(metatraits_continuous))
+
+#合并功能表
+taxonomy_its_traits = merge(taxonomy_its_target,gos_classified_its[,c("ASV_ID","n_hosts","mean_dist","dispersion","category")],by.x="taxid",by.y="ASV_ID",all.x=TRUE)
+taxonomy_its_traits = merge(taxonomy_its_traits,funguild_result,by="taxid",all.x=TRUE)
+write.table(taxonomy_its_traits,file = "result/taxonomy_its_traits.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+taxonomy_16s_traits = merge(taxonomy_16s_target,gos_classified_16s[,c("ASV_ID","n_hosts","mean_dist","dispersion","category")],by.x="taxid",by.y="ASV_ID",all.x=TRUE)
+taxonomy_16s_traits = merge(taxonomy_16s_traits,bugbase_result,by.x="taxid",by.y="row.names",all.x=TRUE)
+taxonomy_16s_traits = merge(taxonomy_16s_traits,faprotax_result,by.x="taxid",by.y="row.names",all.x=TRUE)
+taxonomy_16s_traits = merge(taxonomy_16s_traits,metatraits_boolean,by.x="taxid",by.y="row.names",all.x=TRUE)
+taxonomy_16s_traits = merge(taxonomy_16s_traits,metatraits_continuous,by.x="taxid",by.y="row.names",all.x=TRUE)
+write.table(taxonomy_16s_traits,file = "result/taxonomy_16s_traits.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+```
+
+
+
+
+#制作细菌通才和专才注释文件
+#通才树
+```{r}
+dir.create("result/GOS/tree_16s_g")
+file.copy("result/GOS/result_table/iqtree/tree_g_16s.treefile","result/GOS/tree_16s_g/tree_g_16s.treefile")
+source("scripts/R/Tools.R")
+library(itol.toolkit)
+library(dplyr)
+library(data.table)
+library(ape)
+library(stringr)
+library(tidyr)
+#提取通才分类表
+taxonomy_16s_traits <- read.delim("result/taxonomy_16s_traits.txt")
+annotation <- taxonomy_16s_traits[taxonomy_16s_traits$category=="generalist",]
+
+
+#开始构建树注释文件(通才树)
+annotation = read.delim("result/GOS/tree_16s_g/annotation_16s_g.txt")
+tree <- read.tree("result/GOS/tree_16s_g/tree_g_16s.nwk")
+tree_label = tree$tip.label
+name_df = data.frame(index = c(1:length(tree_label)),
+                     taxid = tree_label)
+annotation = merge(name_df,annotation,by="taxid")
+annotation = annotation %>% arrange(index)
+write.table(annotation,file = "result/GOS/tree_16s_g/annotation_16s_g.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+colorlist1 = c("#99C2C8","#DA7289","#9EB395","#EBD7A5","#C1D2E2",
+               "#099396","#016074","#E9BDA0","#9D2227","#EE9B01",
+               "#3E4069","#A23F25","#517D7E","#CA820A","#808DAA",
+               "#E5A984","#552379","#B24057","#A49BC6","#F7E09B",
+               "#93CEDF","#D5ABBF","#846992","#D98267","#73BEA0",
+               "#E4A644","#BC9F77","#CB3F48","#A94B32","#8A926B",
+               "#9B443B","#7B6D4A","#4B5B74","#C6803A","#CB4047")
+
+colorlist2 = c("#FCB366","#FE816F","#90D7C7","#93BCD0","#AF3F4F",
+               "#E5C28C","#CA8BB6","#1A6C92","#EAB46E","#8CC3BD",
+               "#8F9EC5","#6C77B5","#138A8E","#4B9D77","#8E60A8",
+               "#DC6D73","#B2B896","#E97DAE","#FB7A64","#EDCE35",
+               "#99C2C8","#DA7289","#B24057","#EBD7A5","#92D2C1",
+               "#4E56AB","#0FBFBC","#E9A564","#ADD565","#ADADAD",
+               "#F3BB34","#F8AD9A","#5163B5","#613767","#56B394")
+
+hub <- create_hub(tree = tree)
+#制作Phylum色环
+#配置颜色
+unique_Phylum = unique(annotation$Phylum)
+colorlist_Phylum = colorlist2[1:length(unique_Phylum)]
+Phylum_color_map = data.frame(Phylum = unique_Phylum,
+                             Phylum_color = colorlist_Phylum)
+create_color_legend(Phylum_color_map, save_path = "result/GOS/tree_16s_g/Phylum_legend.pdf", shape = "square", 
+                                layout = "col", n = 1, title = "Phylum", 
+                                label_size = 4, title_size = 6, ifsave = TRUE)
+Phylum_color_map$Phylum_color[Phylum_color_map$Phylum=="Other"] = "#eeeeee"
+unit_Phylum <- create_unit(data = merge(annotation[ ,c("taxid","Phylum")],Phylum_color_map,by="Phylum")[ ,c("taxid","Phylum","Phylum_color")],
+                          key = "Phylum",
+                          type = "DATASET_COLORSTRIP",
+                          tree = tree)
+unit_Phylum@common_themes$legend$horizontal = NULL #调整图例为竖向
+# unit_Phylum@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Phylum
+
+
+#制作Class色环
+#配置颜色
+unique_Class = unique(annotation$Class)
+colorlist_Class = colorlist1[1:length(unique_Class)]
+Class_color_map = data.frame(Class = unique_Class,
+                             Class_color = colorlist_Class)
+create_color_legend(Class_color_map, save_path = "result/GOS/tree_16s_g/Class_legend.pdf", shape = "square", 
+                                layout = "row", n = 3, title = "Class", 
+                                label_size = 4, title_size = 6, ifsave = TRUE)
+Class_color_map$Class_color[Class_color_map$Class=="Other"] = "#eeeeee"
+unit_Class <- create_unit(data = merge(annotation[ ,c("taxid","Class")],Class_color_map,by="Class")[ ,c("taxid","Class","Class_color")],
+                          key = "Class",
+                          type = "DATASET_COLORSTRIP",
+                          tree = tree)
+unit_Class@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Class@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Class
+
+
+#制作好氧/厌氧色环
+unique_bugbase_Aerobic_type = sort(unique(annotation$bugbase_Aerobic_type))
+
+colorlist_bugbase_Aerobic_type = c("#99C2C8","#D4693F","#E4A644","#eeeeee")
+bugbase_Aerobic_type_color_map = data.frame(bugbase_Aerobic_type = unique_bugbase_Aerobic_type,
+                                    bugbase_Aerobic_type_color = colorlist_bugbase_Aerobic_type)
+unit_Aerobic <- create_unit(data = merge(annotation[ ,c("taxid","bugbase_Aerobic_type")],bugbase_Aerobic_type_color_map,by="bugbase_Aerobic_type")[ ,c("taxid","bugbase_Aerobic_type","bugbase_Aerobic_type_color")],
+                            key = "Aerobic_type", 
+                            type = "DATASET_COLORSTRIP", 
+                            tree = tree)
+unit_Aerobic@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Aerobic@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Aerobic
+#制作生物膜色环
+unique_bugbase_Forms_Biofilms = sort(unique(annotation$bugbase_Forms_Biofilms))
+colorlist_bugbase_Forms_Biofilms = c("#E8C2D9","#846992")
+bugbase_Forms_Biofilms_color_map = data.frame(bugbase_Forms_Biofilms = unique_bugbase_Forms_Biofilms,
+                                      bugbase_Forms_Biofilms_color = colorlist_bugbase_Forms_Biofilms)
+unit_bugbase_Forms_Biofilms <- create_unit(data = merge(annotation[ ,c("taxid","bugbase_Forms_Biofilms")],bugbase_Forms_Biofilms_color_map,by="bugbase_Forms_Biofilms")[ ,c("taxid","bugbase_Forms_Biofilms","bugbase_Forms_Biofilms_color")],
+                                   key = "Forms_Biofilms", 
+                                   type = "DATASET_COLORSTRIP",
+                                   tree = tree)
+unit_bugbase_Forms_Biofilms@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_bugbase_Forms_Biofilms@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_bugbase_Forms_Biofilms
+#制作格兰仕阴阳性色环
+unique_bugbase_Gram_type = sort(unique(annotation$bugbase_Gram_type))
+colorlist_bugbase_Gram_type = c("#A1B1CB","#4B5B74")
+bugbase_Gram_type_color_map = data.frame(bugbase_Gram_type = unique_bugbase_Gram_type,
+                                 bugbase_Gram_type_color = colorlist_bugbase_Gram_type)
+unit_bugbase_Gram_type <- create_unit(data = merge(annotation[ ,c("taxid","bugbase_Gram_type")],bugbase_Gram_type_color_map,by="bugbase_Gram_type")[ ,c("taxid","bugbase_Gram_type","bugbase_Gram_type_color")],
+                              key = "Gram_type", 
+                              type = "DATASET_COLORSTRIP", 
+                              tree = tree)
+unit_bugbase_Gram_type@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_bugbase_Gram_type@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_bugbase_Gram_type
+
+#制作流行度柱状图
+n_hosts = annotation[ ,c("taxid","n_hosts")]
+n_hosts$n_hosts[n_hosts$n_hosts=="Unknown"] = 0
+n_hosts$n_hosts = as.numeric(n_hosts$n_hosts)
+unit_n_hosts <- create_unit(data = n_hosts,
+                       key = "n_hosts",
+                       type = "DATASET_SIMPLEBAR",
+                       tree = tree)
+unit_n_hosts@profile$color = "#1A6C92"
+unit_n_hosts@specific_themes$basic_plot$width = 250
+unit_n_hosts@specific_themes$basic_plot$dataset_scale = c(10,20,30,40,50,55)
+hub <- hub + unit_n_hosts
+dir.create("result/GOS/tree_16s_g/itol_annotation")
+write_hub(hub, "result/GOS/tree_16s_g/itol_annotation")
+
+# 常见属的小柱状图
+library(ggplot2)
+library(dplyr)
+freq_pre_df = as.data.frame(table(annotation$Genus))
+freq_pre_df$pre = freq_pre_df$Freq/sum(freq_pre_df$Freq)*100
+freq_pre_df = freq_pre_df[freq_pre_df$Var1!="Incertae Sedis",]
+colnames(freq_pre_df)[1] = "Genus"
+top10_df <- freq_pre_df %>%
+  arrange(desc(pre)) %>% 
+  slice_head(n = 10) %>% 
+  mutate(Genus = factor(Genus, levels = rev(unique(Genus))))
+
+ggplot(top10_df, aes(x = Genus, y = pre, fill = pre)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(round(pre, 2), "%")), 
+            hjust = -0.1, size = 4, color = "black") +
+  scale_fill_gradient(low = "#E0F2FF", high = "#1F4A7A") +
+  ggtitle("Top 10 Genus") +
+  coord_flip() +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    legend.position = "none",  
+    axis.title = element_blank(),  
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(), 
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  ) +
+  expand_limits(y = max(top10_df$pre) * 1.15)
+ggsave("result/GOS/tree_16s_g/top10_genus.pdf",width = 3,height = 3)
+```
+
+```{r}
+dir.create("result/GOS/tree_16s_s")
+file.copy("result/GOS/result_table/tree_s_16s_FastTree.tree","result/GOS/tree_16s_s/tree_s_16s_FastTree.tree")
+source("scripts/R/Tools.R")
+library(itol.toolkit)
+library(dplyr)
+library(data.table)
+library(ape)
+library(stringr)
+library(tidyr)
+#提取通才分类表
+taxonomy_16s_traits <- read.delim("result/taxonomy_16s_traits.txt")
+annotation <- taxonomy_16s_traits[taxonomy_16s_traits$category=="specialist",]
+#开始构建树注释文件(通才树)
+annotation <- annotation %>%
+  group_by(Phylum) %>%
+  mutate(Phylum_count = n()) %>%
+  ungroup() %>%
+  arrange(desc(Phylum_count)) %>%
+  mutate(Phylum_rank = dense_rank(desc(Phylum_count))) %>%
+  mutate(Phylum_simp = ifelse(Phylum_rank > 20, "Other", Phylum)) %>%
+  select(-Phylum_count, -Phylum_rank)
+tree <- read.tree("result/GOS/tree_16s_s/tree_s_16s.nwk")
+tree_label = tree$tip.label
+name_df = data.frame(index = c(1:length(tree_label)),
+                     taxid = tree_label)
+annotation = merge(name_df,annotation,by="taxid")
+annotation = annotation %>% arrange(index)
+write.table(annotation,file = "result/GOS/tree_16s_s/annotation_16s_s.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+
+colorlist1 = c("#99C2C8","#DA7289","#9EB395","#EBD7A5","#C1D2E2",
+               "#099396","#016074","#E9BDA0","#9D2227","#EE9B01",
+               "#3E4069","#A23F25","#517D7E","#CA820A","#808DAA",
+               "#E5A984","#552379","#B24057","#A49BC6","#F7E09B",
+               "#93CEDF","#D5ABBF","#846992","#D98267","#73BEA0",
+               "#E4A644","#BC9F77","#CB3F48","#A94B32","#8A926B",
+               "#9B443B","#7B6D4A","#4B5B74","#C6803A","#CB4047")
+
+colorlist2 = c("#FCB366","#FE816F","#90D7C7","#93BCD0","#AF3F4F",
+               "#E5C28C","#CA8BB6","#1A6C92","#EAB46E","#8CC3BD",
+               "#8F9EC5","#6C77B5","#138A8E","#4B9D77","#8E60A8",
+               "#DC6D73","#B2B896","#E97DAE","#FB7A64","#EDCE35",
+               "#99C2C8","#DA7289","#B24057","#EBD7A5","#92D2C1",
+               "#4E56AB","#0FBFBC","#E9A564","#ADD565","#ADADAD",
+               "#F3BB34","#F8AD9A","#5163B5","#613767","#56B394")
+
+hub <- create_hub(tree = tree)
+#制作Phylum色环
+#配置颜色
+unique_Phylum_s = unique(annotation$Phylum_simp)
+unique_Phylum_g = unique(read.delim("result/GOS/tree_16s_g/annotation_16s_g.txt")$Phylum)
+unique_Phylum_s = c(unique_Phylum_g,setdiff(unique_Phylum_s,unique_Phylum_g))
+colorlist_Phylum = colorlist2[1:length(unique_Phylum_s)]
+Phylum_color_map = data.frame(Phylum_simp = unique_Phylum_s,
+                             Phylum_color = colorlist_Phylum)
+Phylum_color_map$Phylum_color[Phylum_color_map$Phylum_simp=="Other"] = "#eeeeee"
+other_n = which(Phylum_color_map$Phylum_simp=="Other")
+Phylum_color_map = Phylum_color_map[c(c(1:other_n-1),c((other_n+1):length(Phylum_color_map$Phylum_simp)),other_n),]
+create_color_legend(Phylum_color_map, save_path = "result/GOS/tree_16s_s/Phylum_legend.pdf", shape = "square", 
+                                layout = "col", n = 1, title = "Phylum", 
+                                label_size = 4, title_size = 6, ifsave = TRUE)
+unit_Phylum <- create_unit(data = merge(annotation[ ,c("taxid","Phylum_simp")],Phylum_color_map,by="Phylum_simp")[ ,c("taxid","Phylum_simp","Phylum_color")],
+                          key = "Phylum",
+                          type = "DATASET_COLORSTRIP",
+                          tree = tree)
+unit_Phylum@common_themes$legend$horizontal = NULL #调整图例为竖向
+# unit_Phylum@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Phylum
+
+
+#制作好氧/厌氧色环
+unique_bugbase_Aerobic_type = sort(unique(annotation$bugbase_Aerobic_type))
+
+colorlist_bugbase_Aerobic_type = c("#99C2C8","#D4693F","#E4A644","#eeeeee")
+bugbase_Aerobic_type_color_map = data.frame(bugbase_Aerobic_type = unique_bugbase_Aerobic_type,
+                                    bugbase_Aerobic_type_color = colorlist_bugbase_Aerobic_type)
+unit_Aerobic <- create_unit(data = merge(annotation[ ,c("taxid","bugbase_Aerobic_type")],bugbase_Aerobic_type_color_map,by="bugbase_Aerobic_type")[ ,c("taxid","bugbase_Aerobic_type","bugbase_Aerobic_type_color")],
+                            key = "Aerobic_type", 
+                            type = "DATASET_COLORSTRIP", 
+                            tree = tree)
+unit_Aerobic@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_Aerobic@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_Aerobic
+#制作生物膜色环
+unique_bugbase_Forms_Biofilms = sort(unique(annotation$bugbase_Forms_Biofilms))
+colorlist_bugbase_Forms_Biofilms = c("#E8C2D9","#846992")
+bugbase_Forms_Biofilms_color_map = data.frame(bugbase_Forms_Biofilms = unique_bugbase_Forms_Biofilms,
+                                      bugbase_Forms_Biofilms_color = colorlist_bugbase_Forms_Biofilms)
+unit_bugbase_Forms_Biofilms <- create_unit(data = merge(annotation[ ,c("taxid","bugbase_Forms_Biofilms")],bugbase_Forms_Biofilms_color_map,by="bugbase_Forms_Biofilms")[ ,c("taxid","bugbase_Forms_Biofilms","bugbase_Forms_Biofilms_color")],
+                                   key = "Forms_Biofilms", 
+                                   type = "DATASET_COLORSTRIP",
+                                   tree = tree)
+unit_bugbase_Forms_Biofilms@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_bugbase_Forms_Biofilms@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_bugbase_Forms_Biofilms
+#制作格兰仕阴阳性色环
+unique_bugbase_Gram_type = sort(unique(annotation$bugbase_Gram_type))
+colorlist_bugbase_Gram_type = c("#A1B1CB","#4B5B74")
+bugbase_Gram_type_color_map = data.frame(bugbase_Gram_type = unique_bugbase_Gram_type,
+                                 bugbase_Gram_type_color = colorlist_bugbase_Gram_type)
+unit_bugbase_Gram_type <- create_unit(data = merge(annotation[ ,c("taxid","bugbase_Gram_type")],bugbase_Gram_type_color_map,by="bugbase_Gram_type")[ ,c("taxid","bugbase_Gram_type","bugbase_Gram_type_color")],
+                              key = "Gram_type", 
+                              type = "DATASET_COLORSTRIP", 
+                              tree = tree)
+unit_bugbase_Gram_type@common_themes$legend$horizontal = NULL #调整图例为竖向
+unit_bugbase_Gram_type@specific_themes$strip_label$color_branches = NULL #取消树枝颜色
+hub <- hub + unit_bugbase_Gram_type
+
+dir.create("result/GOS/tree_16s_s/itol_annotation")
+write_hub(hub, "result/GOS/tree_16s_s/itol_annotation")
+
+# 常见属的小柱状图
+library(ggplot2)
+library(dplyr)
+freq_pre_df = as.data.frame(table(annotation$Genus))
+freq_pre_df$pre = freq_pre_df$Freq/sum(freq_pre_df$Freq)*100
+freq_pre_df = freq_pre_df[freq_pre_df$Var1!="Incertae Sedis",]
+colnames(freq_pre_df)[1] = "Genus"
+top10_df <- freq_pre_df %>%
+  arrange(desc(pre)) %>% 
+  slice_head(n = 10) %>% 
+  mutate(Genus = factor(Genus, levels = rev(unique(Genus))))
+
+ggplot(top10_df, aes(x = Genus, y = pre, fill = pre)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(round(pre, 2), "%")), 
+            hjust = -0.1, size = 4, color = "black") +
+  scale_fill_gradient(low = "#E0F2FF", high = "#1F4A7A") +
+  ggtitle("Top 10 Genus") +
+  coord_flip() +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    legend.position = "none",  
+    axis.title = element_blank(),  
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(), 
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  ) +
+  expand_limits(y = max(top10_df$pre) * 1.15)
+ggsave("result/GOS/tree_16s_s/top10_genus.pdf",width = 3,height = 3)
+```
+
+#基于picrust2结果探索基因出现频率与n_hosts的关系
+```{r}
+rm(list = ls())
+dir.create("result/traits_prevalence")
+source("scripts/R/Tools.R")
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(data.table)
+taxonomy_16s_traits = read.delim("result/taxonomy_16s_traits.txt")
+ko_data = fread("Function_prediction/picrust2/ko_data_nsti_filtered.txt")
+ko_data = column_to_rownames(as.data.frame(ko_data),colnames(ko_data)[1])
+
+ko_data[ko_data != 0] = 1
+type_data = taxonomy_16s_traits[,c("taxid","n_hosts")]
+type_data$n_hosts[type_data$n_hosts >= 20] = 20
+
+indata = merge(type_data,ko_data,by.x = "taxid",by.y = "row.names")
+# 合并数据并计算比例
+result_df <- indata %>%
+  # 将数据转换为长格式以便按流行率分组
+  pivot_longer(cols = -c(taxid, n_hosts), 
+               names_to = "gene", 
+               values_to = "presence") %>%
+  # 按流行率和基因分组
+  group_by(n_hosts, gene) %>%
+  # 计算每个组别的比例
+  summarise(
+    proportion = sum(presence == 1, na.rm = TRUE) / n(),
+    .groups = "drop"
+  ) 
+
+result_df <- spread(result_df, key = "gene",
+                    value = "proportion")
+
+# 设置显著性水平（通常为0.05，可根据需要调整）
+alpha <- 0.01
+
+# 初始化存储显著正相关和负相关列名的字符向量
+positive_vars <- character(0)
+negative_vars <- character(0)
+
+# 提取自变量（第一列）和因变量（其他列）
+result_df$n_hosts = as.numeric(result_df$n_hosts)
+independent_var <- result_df$n_hosts
+dependent_df <- result_df[, -1, drop = FALSE]  # 因变量数据框（保持数据框结构）
+
+# 循环遍历每个因变量列
+for (col_name in names(dependent_df)) {
+  dependent_var <- dependent_df[[col_name]]  # 提取当前因变量列
+  
+  # 执行相关性检验（默认使用Pearson，可修改method参数）
+  # 使用tryCatch避免因错误（如缺失值过多）中断循环
+  test_result <- tryCatch({
+    cor.test(independent_var, dependent_var, method = "pearson")  # 可改为"spearman"或"kendall"
+  }, error = function(e) {
+    return(NULL)  # 如果出错（如数据问题），返回NULL
+  })
+  
+  # 跳过出错的列
+  if (is.null(test_result)) next
+  
+  # 提取p值和相关系数
+  p_value <- test_result$p.value
+  cor_coef <- test_result$estimate
+  
+  # 检查是否有效（避免NA值）
+  if (!is.na(p_value) && !is.na(cor_coef)) {
+    # 判断显著性及相关方向
+    if (p_value < alpha) {
+      if (cor_coef > 0) {
+        positive_vars <- c(positive_vars, col_name)  # 显著正相关
+      } else if (cor_coef < 0) {
+        negative_vars <- c(negative_vars, col_name)  # 显著负相关
+      }
+    }
+  }
+}
+
+#导入kegg分类信息
+ko_level_table = read.delim("db/ko_level_table.txt")
+p_ko_level = ko_level_table[ko_level_table$KO%in%positive_vars,]
+write.table(p_ko_level,file = "result/traits_prevalence/p_ko_level.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+n_ko_level = ko_level_table[ko_level_table$KO%in%negative_vars,]
+write.table(n_ko_level,file = "result/traits_prevalence/n_ko_level.txt",quote = FALSE,sep = "\t",row.names = FALSE,fileEncoding = "UTF-8")
+#对比level3下前20正相关基因和负相关基因的差异
+freq_table <- table(p_ko_level$level3)
+sorted_freq <- sort(freq_table, decreasing = TRUE)
+p_level3_10 <- names(sorted_freq)[1:10]
+freq_table <- table(n_ko_level$level3)
+sorted_freq <- sort(freq_table, decreasing = TRUE)
+n_level3_10 <- names(sorted_freq)[1:10]
+# 提取p_level3_10独有的元素
+p_level3_10_unique <- setdiff(p_level3_10, n_level3_10)
+p_level3_10_unique
+
+# 提取n_level3_10独有的元素
+n_level3_10_unique <- setdiff(n_level3_10, p_level3_10)
+n_level3_10_unique
+
+# 共有的功能
+common_func = intersect(n_level3_10, p_level3_10)
+common_func
+
+
+
+
+
+
+
+p_ko_pathway = as.data.frame(table(p_ko_level$level3))
+colnames(p_ko_pathway)[1] = "Pathway"
+p_ko_pathway = p_ko_pathway[order(p_ko_pathway$Freq, decreasing = TRUE), ][c(1:15),]
+n_ko_pathway = as.data.frame(table(n_ko_level$level3))
+colnames(n_ko_pathway)[1] = "Pathway"
+n_ko_pathway = n_ko_pathway[order(n_ko_pathway$Freq, decreasing = TRUE), ][c(1:15),]
+
+colnames(p_ko_pathway)[2] = "p_freq"
+colnames(n_ko_pathway)[2] = "n_freq"
+
+pn_ko_pathway = merge(p_ko_pathway,n_ko_pathway,by = "Pathway",all = T)
+pn_ko_pathway[is.na(pn_ko_pathway)] = 0
+mutal_pathway = pn_ko_pathway[pn_ko_pathway$Pathway%in%intersect(p_ko_pathway$Pathway,n_ko_pathway$Pathway),]
+mutal_pathway$diff = mutal_pathway$p_freq-mutal_pathway$n_freq
+mutal_pathway = mutal_pathway[order(-mutal_pathway$diff), ][ ,-4]
+p_pathway = pn_ko_pathway[pn_ko_pathway$Pathway%in%setdiff(p_ko_pathway$Pathway,n_ko_pathway$Pathway),]
+p_pathway <- p_pathway[order(-p_pathway$p_freq), ]
+n_pathway = pn_ko_pathway[pn_ko_pathway$Pathway%in%setdiff(n_ko_pathway$Pathway,p_ko_pathway$Pathway),]
+n_pathway <- n_pathway[order(n_pathway$n_freq), ]
+pn_ko_pathway_order = rbind(p_pathway,mutal_pathway,n_pathway)
+
+df_long <- pivot_longer(pn_ko_pathway_order, 
+                        cols = c(p_freq, n_freq), 
+                        names_to = "variable", 
+                        values_to = "value")
+
+df_long$Pathway <- factor(df_long$Pathway, levels = pn_ko_pathway_order$Pathway)
+df_long$variable <- factor(df_long$variable, levels =c("p_freq","n_freq"))
+
+# Plot
+ggplot(df_long, aes(x = Pathway, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(x = "Pathway", y = "Occurrence Rate", title = "", fill = "") +
+  scale_fill_manual(values = c("p_freq" = "#DE7117", "n_freq" = "#355070")) +
+  theme_classic() +
+  theme(
+    legend.position = "top",
+    panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+    axis.text.x  = element_text(size = 14, color = "black", angle = -45, hjust = 0, vjust = 1),
+    axis.title.x = element_text(size = 14, color = "black", face = "bold"),
+    axis.text.y  = element_text(size = 14, color = "black"),
+    axis.title.y = element_text(size = 14, color = "black", face = "bold"),
+    legend.title = element_text(size = 14, color = "black"),
+    legend.text  = element_text(size = 14, color = "black"),
+    plot.margin  = margin(t = 10, r = 130, b = 10, l = 10, unit = "pt")
+  )
+ggsave("result/traits_prevalence/pn_ko_pathway.pdf",width = 15,height = 6)
+```
+
+---
+
+# 10. 性状 × 宿主数关联（traits_prevalence）— 微生物性状与宿主分布广度的关系
+
+目的：检验"宿主分布更广（通才）的种子微生物是否系统性携带特定性状"。`n_hosts` = ASV 出现的宿主物种数（封顶 20；>20 仅占 0.8%/1.3%，封顶抑制长尾对估计的杠杆影响）。
+
+- **数值性状**（16S 15 个 metatraits）：Spearman rho vs n_hosts，p 来自 cor.test，BH-FDR。
+- **布尔性状**（16S 108 个 bugbase/faprotax/metatraits + ITS 7 个 funguild）：
+  - 主检验：logistic `TRUE ~ log2(n_hosts+1)`，Wald p，BH-FDR；
+  - 效应量：秩-二列 rho（0/1 与 n_hosts 的 Spearman，与数值 rho 同尺度，可直接对比）；
+  - 辅证：分箱占比相关 rho_binned（仅报告，不作主统计量——19 个平滑聚合点导致伪高）。
+- 布尔分母 = 已注释 ASV（NA 剔除）。ITS 无数值性状。
+- 镜像脚本：scripts/R/traits_prevalence.R（独立运行版本，二者需保持同步）。
+
+## 10.1 环境与配置
+
+```{r tp-setup}
+# 结果表 / 图输出目录（脚本内由 BASE_DIR 环境变量覆盖，默认 D:/seed_meta_new/Downstream_analysis）
+TP_TAB <- "result/traits_prevalence/result_table"
+TP_FIG <- "result/traits_prevalence/result_figure"
+```
+
+## 10.2 运行分析（结果表 + 图）
+
+```{r tp-run}
+source("scripts/R/traits_prevalence.R")
+```
+
+## 10.3 结果表
+
+```{r tp-tab-numeric}
+tp_num <- data.table::fread(file.path(TP_TAB, "results_numeric_16s.tsv"))
+knitr::kable(tp_num[, .(trait, n, coverage, rho, p, FDR)][order(FDR)],
+             caption = "16S 数值性状 vs n_hosts（Spearman rho，BH-FDR 校正）", digits = 4)
+```
+
+```{r tp-tab-boolean}
+tp_bool <- data.table::fread(file.path(TP_TAB, "results_boolean_16s.tsv"))
+knitr::kable(tp_bool[order(FDR_wald)][1:25,
+           .(trait, n_annot, coverage, prev_overall, rho, OR_doubling, p_wald, FDR_wald)],
+             caption = "16S 布尔性状 Top25（logistic Wald p + BH-FDR；OR = 每 2 倍宿主数）", digits = 4)
+```
+
+```{r tp-tab-its}
+tp_its <- data.table::fread(file.path(TP_TAB, "results_boolean_its.tsv"))
+knitr::kable(tp_its[order(FDR_wald),
+           .(trait, n_annot, coverage, prev_overall, rho, OR_doubling, p_wald, FDR_wald)],
+             caption = "ITS 布尔性状（7 个 funguild 性状）", digits = 4)
+```
+
+## 10.4 图
+
+```{r tp-fig-numeric, out.width="100%", fig.cap="数值火山图（16S）：x=Spearman rho，y=-log10(BH-FDR)。宿主分布越广的细菌基因组更大、GC 更高、耐冷更差。"}
+if (file.exists(file.path(TP_FIG, "fig_numeric_volcano_16s.jpg")))
+  knitr::include_graphics(file.path(TP_FIG, "fig_numeric_volcano_16s.jpg"))
+```
+
+```{r tp-fig-heatmap, out.width="100%", fig.cap="布尔分箱占比热图（16S|ITS）：行为性状（按 rho 排序），列为 n_hosts 1–20，色=箱内 TRUE 占比 − 该性状总体占比（灰=<10 个已注释 ASV）。"}
+if (file.exists(file.path(TP_FIG, "fig_boolean_prevalence_heatmap.jpg")))
+  knitr::include_graphics(file.path(TP_FIG, "fig_boolean_prevalence_heatmap.jpg"))
+```
+
+```{r tp-fig-volcano, out.width="100%", fig.cap="布尔火山图（16S+ITS 合并单图，115 性状）：y=log10(-log10 FDR)（16S FDR 跨 ~90 个数量级，线性轴会把底部压成一条线）。funguild=绿色菱形、不标注（见 10.4 缩放图）；仅标 16S 显著前 14。"}
+if (file.exists(file.path(TP_FIG, "fig_boolean_volcano.jpg")))
+  knitr::include_graphics(file.path(TP_FIG, "fig_boolean_volcano.jpg"))
+```
+
+```{r tp-fig-combined, out.width="100%", fig.cap="组图：数值火山图（左）| 布尔火山图（右）左右拼接。"}
+if (file.exists(file.path(TP_FIG, "fig_trait_nhost_combined.jpg")))
+  knitr::include_graphics(file.path(TP_FIG, "fig_trait_nhost_combined.jpg"))
+```
+
+```{r tp-fig-zoom, out.width="100%", fig.cap="小布尔图：所有布尔点仍显示，整图按 funguild 点范围裁切、无图例、funguild 7 点标注。可手动拼到 10.4 布尔火山图旁。"}
+if (file.exists(file.path(TP_FIG, "fig_boolean_funguild_zoom.jpg")))
+  knitr::include_graphics(file.path(TP_FIG, "fig_boolean_funguild_zoom.jpg"))
+```
+
+## 10.5 主要发现
+
+- **16S 数值性状（12/15 FDR<0.05）**：宿主分布广（高 n_hosts）的细菌基因组更大（genome.size rho=+0.165）、GC 更高（+0.130）、温度下限更高（temperature.minimum rho=-0.208，即更不耐冷、偏向宿主体温环境）、pH 生长范围更窄。
+- **16S 布尔性状（73/108 FDR<0.05）**：随 n_hosts 上升最显著——bugbase_Stress_Tolerant（OR 1.99/2 倍宿主数）、Forms_Biofilms（1.89）、Contains_Mobile_Elements（1.68）、Catalase（2.42）、aerotolerant（2.65）、human_associated（1.63）等；随 n_hosts 下降——bugbase_Anaerobic（OR 0.37）、obligate.anaerobic（0.38）、Gram_Positive（0.73）。
+- **ITS 布尔性状（7 个）**：Pathotroph 与 n_hosts 正相关（rho=+0.086，OR 1.26/2 倍，FDR=0.021）；Mycorrhizal 边缘负相关（FDR=0.066，占比仅 1.7%，结论需谨慎）；其余不显著。
+- **方法学 caveat**：分箱占比相关（rho_binned）普遍偏高（0.6–0.95，19 个平滑聚合点放大单调趋势），仅作分箱可视化辅证；显著性以 ASV 级 logistic Wald p 为准。
+
+---
+
+# 11. KO 基因存在/缺失 × 宿主数关联（ko_prevalence）— PICRUSt2 功能基因与宿主分布广度
+
+目的：用与布尔性状完全相同的方法，检验 PICRUSt2 功能基因（KO，二值化存在/缺失）是否与宿主分布广度（`n_hosts`，封顶 20）系统性关联——"宿主分布更广（通才）的细菌携带哪些代谢/通路基因"。
+
+- **数据**：`Function_prediction/picrust2/ko_data_nsti_filtered.txt`，9994 ASV × 14106 KO 整数拷贝计数（>0 = 存在）；`n_hosts` 由 `taxonomy_16s_traits.txt` 映射；KEGG 层级注释取 `db/ko_level_table.txt`（level1/2/3 + KO_name）。
+- **统计**：logistic `存在 ~ log2(n_hosts+1)`，n_hosts 封顶后 x 只有 20 个不同值 → 按箱分组对 MLE 无损，用共享 20×2 设计矩阵全向量化 IRLS 一次拟合全部 14106 个 KO（约 4 s）。
+  - 主显著 p = 偏差 LR 检验（分离下仍有效；正常 KO 与 Wald 渐近等价——收敛非分离 KO 中 LR 与 Wald 的 FDR 结论一致率 98.4%，差异集中在 p 值接近 0.05 边界处）；
+  - Wald OR（每 2 倍宿主数）一并报告，近分离 KO（迭代未收敛 / |b1|>15）OR/CI 置 NA；
+  - 效应量 = 秩-二列 rho（与性状 rho 同尺度可直接对比）；BH-FDR，`sig := FDR_lr < 0.05`。
+- **镜像脚本**：scripts/R/ko_prevalence.R（独立运行版本，二者需保持同步）。
+
+## 11.1 环境与配置
+
+```{r ko-setup}
+# 结果表 / 图输出目录（脚本内由 BASE_DIR 环境变量覆盖，默认 D:/seed_meta_new/Downstream_analysis）
+# 与性状分析共用 result/traits_prevalence/{result_table, result_figure}
+KO_TAB <- "result/traits_prevalence/result_table"
+KO_FIG <- "result/traits_prevalence/result_figure"
+```
+
+## 11.2 运行分析（结果表 + 图）
+
+```{r ko-run}
+source("scripts/R/ko_prevalence.R")
+```
+
+## 11.3 结果表
+
+```{r ko-tab}
+ko_res <- data.table::fread(file.path(KO_TAB, "results_ko_16s.tsv"))
+knitr::kable(ko_res[sig == TRUE][order(FDR_lr)][1:20,
+       .(KO, KO_name, level2, level3, prevalence, rho, OR_doubling, FDR_lr)],
+       caption = "KO 显著 Top20（按 FDR_lr；OR = 每 2 倍宿主数；rho = 秩-二列）", digits = 4)
+```
+
+## 11.4 图
+
+```{r ko-fig-volcano, out.width="100%", fig.cap="KO 火山组图 a|b|c：x=秩-二列 rho（KO 存在与否 vs n_hosts，封顶 20），y=-log10(BH-FDR)（对数轴）；仅显著点按 KEGG level3 上色（Top12 + Other，Other 更小更淡）。a/c 翼区用 y=[3,150] 纵向拉伸显示（a=左翼 rho∈[-0.23,-0.10]，n=165；c=右翼 rho∈[0.10,0.23]，n=2000），b 中两个虚线框标出 a/c 显示窗口。"}
+if (file.exists(file.path(KO_FIG, "fig_ko_volcano_group.jpg")))
+  knitr::include_graphics(file.path(KO_FIG, "fig_ko_volcano_group.jpg"))
+```
+
+```{r ko-fig-pies, out.width="100%", fig.cap="四饼图 2×2（左/右翼 × KEGG level3/level2）：点集与火山图 a/c 面板显示点完全一致（左翼 n=165，右翼 n=2000）；label=FALSE，limit_n=15，其余并入 Other。"}
+if (file.exists(file.path(KO_FIG, "fig_ko_pies_4.jpg")))
+  knitr::include_graphics(file.path(KO_FIG, "fig_ko_pies_4.jpg"))
+```
+
+## 11.5 主要发现
+
+- **9580 个被检 KO 中 5642 个显著（FDR_lr<0.05，58.9%）**；显著 rho 范围约 [-0.210, +0.284]。左右翼显著点高度不对称：左翼（窄宿主富集）仅 165 个，右翼（广宿主富集）2000 个——广宿主细菌整体更"基因齐全"，部分反映基因组更大（与 §10 基因组大小正相关一致）。
+- **最显著的基因**：MFS 转运蛋白 K19577（rho=+0.284，FDR~1e-217）、细胞色素 o 泛醇氧化酶亚基 II/III/IV/I（K02297/K02299/K02300/K02298，氧化磷酸化，rho 0.22–0.25）、LysR 型转录调控 K05596、AsmA 家族 K07290、FMN 还原酶 K00299、ZapE K06916、硫代硫酸盐硫转移酶 K01011 —— 富集于广宿主菌的以转运、能量代谢（呼吸链）、转录调控为主。
+- **左翼（窄宿主菌保留）**：DNA 错配修复 MutS2 K07456（rho=-0.210）、双功能寡核糖核酸酶 NrnA K06881、核糖核酸酶 Y K18682、ATP 依赖 Clp 蛋白酶 ClpC K03696、二氢乳清酸脱氢酶 K02823 —— 以 DNA 修复 / RNA 代谢 / 伴侣蛋白为主。
+- **显著 level3 类别（按显著 KO 数）**：Transporters（854）、Enzymes with EC numbers（372）、Transcription factors（275）、Function unknown（238）、Secretion system（197）、Two-component system（192）、Peptidases and inhibitors（119）、Bacterial motility proteins（119）、Antimicrobial resistance genes（105）、DNA repair and recombination proteins（90）、Prokaryotic defense system（90）、LPS biosynthesis proteins（72）。
+- **方法学 caveat**：KO 是拷贝计数二值化（>0 存在），且 9994 个 ASV 均来自 PICRUSt2 预测（NSTI 过滤），"基因存在"仍为基因组潜力而非表达；显著 KO 过半，反映宿主范围对基因库组成有强结构效应，单基因结论宜配合 level2/level3 类别层面解读。
+
+## 11.6 左右翼富集 KO 的 PGPG（植物促生菌基因）注释与富集分析
+
+目的：用 **`db/ko_pgpg_levels.txt`**（2025 年一项植物促生菌（PGPG）预测研究的 KO→PGPG 功能注释表，每 KO 一行；层级 Lv1=3 / Lv2=8 / Lv3=43）对 §11 左右翼富集 KO（左翼=专才/窄宿主 n=165，右翼=通才/广宿主 n=2000）做注释、富集检验与可视化。**该部分随 `ko-run` chunk 内的 ko_prevalence.R Part 3 一起运行**（镜像脚本需保持同步）。
+
+- **注释连接**：按 KO 左连接至结果表；无注释 KO 保留（`No PGPG`）。
+- **统计**（左右翼直接对比为主视图）：每 PGPG 类别 3 族 Fisher 2×2 检验——①左右翼直接对比 `[[n_L,N_L−n_L],[n_R,N_R−n_R]]`；②左翼 vs 全部 9,580 被测背景；③右翼 vs 背景；各族内 **BH-FDR**（FDR_LR / FDR_L / FDR_R）。`sparse_LR`（min expected < 5）标注稀疏格，**不作强结论**。
+- **产物**（result_table / result_figure）：
+  - 表：`pgpg_coverage.tsv`（注释覆盖 + Lv1 分布）、`pgpg_composition_lv{2,3}.tsv`（组成）、`pgpg_enrichment_lv{2,3}.tsv`（富集）。
+  - 图：`fig_pgpg_volcano`（复用 a/b/c 火山布局，显著点按 PGPG Lv2 着色）、`fig_pgpg_pies_4`（左/右 × Lv2/Lv3 四饼图）。
+
+### 11.6.1 注释覆盖
+
+```{r pgpg-tab-coverage}
+pgpg_cov <- data.table::fread(file.path(KO_TAB, "pgpg_coverage.tsv"))
+knitr::kable(pgpg_cov, caption = "PGPG 注释覆盖：各集合（全部被测/显著/左翼/右翼）已注释 KO 数与 Lv1 分布", digits = 4)
+```
+
+### 11.6.2 富集检验（左右翼直接对比，BH-FDR）
+
+```{r pgpg-tab-enrich-lv2}
+pgpg_enr2 <- data.table::fread(file.path(KO_TAB, "pgpg_enrichment_lv2.tsv"))
+knitr::kable(pgpg_enr2[order(FDR_LR),
+           .(category, Lv1, n_L, frac_L, n_R, frac_R, OR_LR, FDR_LR, direction, sparse_LR)],
+           caption = "PGPG Lv2 富集（8 类）：n_L/n_R = 左/右翼内计数；OR_LR = 左/右翼直接对比 Fisher 比值比；FDR_LR = BH-FDR；direction = 富集侧", digits = 4)
+```
+
+```{r pgpg-tab-enrich-lv3}
+pgpg_enr3 <- data.table::fread(file.path(KO_TAB, "pgpg_enrichment_lv3.tsv"))
+knitr::kable(pgpg_enr3[order(FDR_LR)][1:15,
+           .(category, Lv1, n_L, n_R, OR_LR, FDR_LR, direction, sparse_LR)],
+           caption = "PGPG Lv3 富集 Top15（43 类）：⚠️ 左翼仅 86 个已注释 KO，sparse_LR=TRUE 类仅作方向性提示，不作强结论", digits = 4)
+```
+
+### 11.6.3 图
+
+```{r pgpg-fig-volcano, out.width="100%", fig.cap="PGPG 火山组图 a|b|c：布局与 §11 fig_ko_volcano_group 一致，显著点改按 PGPG Lv2（8 类）着色，未注释 KO 为灰色（No PGPG）。a/c 翼区仍为 y=[3,150] 纵向拉伸窗口（a=左翼 n=165，c=右翼 n=2000）。"}
+if (file.exists(file.path(KO_FIG, "fig_pgpg_volcano.jpg")))
+  knitr::include_graphics(file.path(KO_FIG, "fig_pgpg_volcano.jpg"))
+```
+
+```{r pgpg-fig-pies, out.width="100%", fig.cap="PGPG 四饼图 2×2（左/右翼 × Lv2/Lv3）：点集 = 翼窗口内已注释 KO（左 n=86，右 n=1426）；label=FALSE，limit_n=15，其余并入 Other。"}
+if (file.exists(file.path(KO_FIG, "fig_pgpg_pies_4.jpg")))
+  knitr::include_graphics(file.path(KO_FIG, "fig_pgpg_pies_4.jpg"))
+```
+
+### 11.6.4 主要发现
+
+- **注释覆盖**：左翼 86/165（52.1%）低于右翼 1426/2000（71.3%）——左翼近半 KO 无 PGPG 注释，Lv3 细分类在左翼普遍稀疏。
+- **Lv2（3/8 显著，FDR_LR<0.05）**：
+  - **COMPETITIVE_EXCLUSION|CE 左翼富集**（OR_LR=2.39，39/165=23.6% vs 右翼 11.5%）→ 窄宿主 KO 显著过度代表微生物竞争排除类功能；
+  - **COLONIZING_PLANT_SYSTEM 右翼富集**（OR_LR=0.246，450/2000=22.5%）与 **BIO-FERTILIZATION 右翼富集**（OR_LR=0.450，297/2000=14.9%）→ 广宿主 KO 偏向植物定殖与促生。
+- **Lv3 最强信号**：**CE-SPORE_PRODUCTION 左翼 OR≈153**（22/165 vs 右翼 2/2000，FDR=6.8e-22）——窄宿主 KO 极强富集"竞争排除-产孢"功能；右翼另富集定殖相关细分（植物来源底物利用，FDR_LR<0.05）。⚠️ 该 Lv3 类 sparse_LR=TRUE，仅作方向性提示。
+
+
+
+# 12. 特殊分类群（Special classification groups）分析
+
+目的：聚焦 4 组具有特殊生态/功能属性的种子微生物类群，刻画其在宿主分布、相对丰度、分类组成与宿主关联上的格局。
+
+- **4 组定义**（组 ASV 成员由 `scripts/R/special_group_members.R` 构建并验证于 CSS 表）：
+  - **Mycorrhizal** 菌根真菌 —— funguild `Mycorrhizal==TRUE`（ITS）；
+  - **Anaerobic** 厌氧细菌 —— bugbase `Anaerobic==TRUE`（16S）；
+  - **Nitrogen_fix** 固氮细菌 —— faprotax `nitrogen_fixation==TRUE`（16S）；
+  - **Small_genome** 小基因组细菌 —— metatraits genome size 非 NA 值中最小的 1%（16S）。
+- **统计**：宿主属级丰度/richness/Shannon/优势属、宿主目级汇总 + 跨目 KW、组内属级流行度/生态位宽度/Core-Specialist 分类、属×宿主目 KW（BH-FDR）、宿主属丰度–richness Spearman。
+- **图形**（PDF + 300-dpi JPG，均输出到 `result_figure/`）：
+  - `fig_scg_asv_count` ASV 数；`fig_scg_relabund_distribution` 样本级丰度分布；
+  - `fig_scg_tax_composition_order` Order 级组成堆积柱；`fig_scg_gos_composition` GOS 通才/专才组成堆积柱（Generalist/Specialist/Intermediate/Random）；`fig_scg_tax_gos_composition` 上=Order 组成、下=GOS 组成（4 列 × 2 行组图）；`fig_scg_genus_heatmap_{组}` 属×宿主属聚类热图（4 张）；
+  - `fig_scg_genus_strategy` 属级 GOS 策略景观（右下角饼图 = 组内 GOS 构成）；`fig_scg_host_loading` 宿主蓄水池载量（top-15 宿主属）。
+- **镜像脚本**：scripts/R/special_group_{members,analysis,taxonomy,statistics,taxonomy_depth,visualize}.R（独立运行版本，二者需保持同步）。
+
+## 12.1 环境与配置
+
+```{r scg-setup}
+# 结果表 / 图输出目录（脚本内由 BASE_DIR 环境变量覆盖，默认 D:/seed_meta_new/Downstream_analysis）
+SCG_TAB <- "result/Special_classification_group/result_table"
+SCG_FIG <- "result/Special_classification_group/result_figure"
+```
+
+## 12.2 运行分析（结果表 + 图）
+
+```{r scg-run-members}
+source("scripts/R/special_group_members.R")
+```
+
+```{r scg-run-analysis}
+source("scripts/R/special_group_analysis.R")
+```
+
+```{r scg-run-taxonomy}
+source("scripts/R/special_group_taxonomy.R")
+```
+
+```{r scg-run-statistics}
+source("scripts/R/special_group_statistics.R")
+```
+
+```{r scg-run-depth}
+source("scripts/R/special_group_taxonomy_depth.R")
+```
+
+```{r scg-run-visualize}
+source("scripts/R/special_group_visualize.R")
+```
+
+## 12.3 结果表
+
+```{r scg-tab-overview}
+scg_ov <- data.table::fread(file.path(SCG_TAB, "stat_group_overview.tsv"))
+knitr::kable(scg_ov, caption = "4 组概览：ASV 数 / 宿主属 / 宿主目 / 组内属 / 流行度 / 丰度 / Core 属数", digits = 3)
+```
+
+```{r scg-tab-depth}
+scg_depth <- data.table::fread(file.path(SCG_TAB, "stat_taxonomy_depth.tsv"))
+knitr::kable(scg_depth[, .(group, n_asvs, n_genus_resolved, pct_genus_resolved,
+                           n_unres_to_family, n_unres_nothing_below_kingdom)],
+             caption = "注释深度：每组解析到属的 ASV 比例（Mycorrhizal 仅 74%，其余 100%）", digits = 1)
+```
+
+```{r scg-tab-host}
+scg_host <- data.table::rbindlist(lapply(c("Mycorrhizal", "Anaerobic", "Nitrogen_fix", "Small_genome"), function(g) {
+  h <- data.table::fread(file.path(SCG_TAB, sprintf("stat_host_summary_%s.tsv", g)))
+  h[order(-richness)][1:5, .(group = g, host, Order, richness, relabund_pct, dominant_genus)]
+}))
+knitr::kable(scg_host, caption = "各组成员属 richness 最高的 5 个宿主属", digits = 3)
+```
+
+```{r scg-tab-genus}
+scg_genus <- data.table::rbindlist(lapply(c("Mycorrhizal", "Anaerobic", "Nitrogen_fix", "Small_genome"), function(g) {
+  s <- data.table::fread(file.path(SCG_TAB, sprintf("stat_genus_summary_%s.tsv", g)))
+  s[order(-prevalence_pct)][1:5, .(group = g, genus, Phylum, category,
+                                   prevalence_pct, mean_relabund_pct, detection_mean_pct)]
+}))
+knitr::kable(scg_genus, caption = "各组成员属流行度 Top5（占宿主属 %）", digits = 2)
+```
+
+```{r scg-tab-gos}
+scg_gos <- data.table::fread(file.path(SCG_TAB, "stat_gos_composition.tsv"))
+data.table::dcast(scg_gos, group ~ taxon, value.var = "count") |>
+  knitr::kable(caption = "各组成 GOS 类别 ASV 计数（Random=超出 GOS 注释范围的 ASV，Myco 占 89.9% 最高）", digits = 0)
+```
+
+## 12.4 图
+
+```{r scg-fig-asvcount, out.width="100%", fig.cap="各组成 ASV 数（Anaerobic 最大 3479，Small_genome 最小 108）。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_asv_count.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_asv_count.jpg"))
+```
+
+```{r scg-fig-relabund, out.width="100%", fig.cap="各组成样本级相对丰度分布（log10，仅阳性样本；y 轴为百分比、上限 100%；x 轴标注检出率）。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_relabund_distribution.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_relabund_distribution.jpg"))
+```
+
+```{r scg-fig-composition, out.width="100%", fig.cap="4 组 Order 级 ASV 组成堆积柱（Top-12 目 + Other，段内标注 ASV 数）。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_tax_composition_order.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_tax_composition_order.jpg"))
+```
+
+```{r scg-fig-gos, out.width="100%", fig.cap="4 组 GOS（通才/专才）类别组成堆积柱：Generalist 深红 / Specialist 深蓝 / Intermediate 橙 / Random 浅灰蓝（Random=超出 GOS 注释范围的 ASV，固定沉底）。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_gos_composition.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_gos_composition.jpg"))
+```
+
+```{r scg-fig-tax-gos, out.width="100%", fig.cap="4 列 × 2 行组图：上行=Order 级分类组成，下行=GOS 类别组成（Generalist/Specialist/Intermediate/Random）；上下列柱严格对齐。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_tax_gos_composition.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_tax_gos_composition.jpg"))
+```
+
+```{r scg-fig-heatmap-myco, out.width="100%", fig.cap="菌根真菌属×宿主属热图（log10 平均相对丰度，行 z-score，ward.D2 聚类；行注=门，列注=宿主目）。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_genus_heatmap_Mycorrhizal.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_genus_heatmap_Mycorrhizal.jpg"))
+```
+
+```{r scg-fig-heatmap-ana, out.width="100%", fig.cap="厌氧菌属×宿主属热图（同上）。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_genus_heatmap_Anaerobic.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_genus_heatmap_Anaerobic.jpg"))
+```
+
+```{r scg-fig-heatmap-nfix, out.width="100%", fig.cap="固氮菌属×宿主属热图（同上）。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_genus_heatmap_Nitrogen_fix.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_genus_heatmap_Nitrogen_fix.jpg"))
+```
+
+```{r scg-fig-heatmap-smg, out.width="100%", fig.cap="小基因组菌属×宿主属热图（同上）。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_genus_heatmap_Small_genome.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_genus_heatmap_Small_genome.jpg"))
+```
+
+```{r scg-fig-strategy, out.width="100%", fig.cap="属级生态策略景观：x=宿主流行度，y=检出时丰度（log10），点大小=总体平均丰度，形状=GOS 类别；右下角饼图=组内 GOS 构成（红通才/蓝专才/灰其他）。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_genus_strategy.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_genus_strategy.jpg"))
+```
+
+```{r scg-fig-loading, out.width="100%", fig.cap="宿主蓄水池载量：各面板按组-属 richness 降序列出 top-15 宿主属（点色=宿主目，点大小=组平均相对丰度）。"}
+if (file.exists(file.path(SCG_FIG, "fig_scg_host_loading.jpg")))
+  knitr::include_graphics(file.path(SCG_FIG, "fig_scg_host_loading.jpg"))
+```
+
+## 12.5 主要发现
+
+- **组分规模与流行度**：Anaerobic 最大（3479 ASV，57.2% 样本检出），Nitrogen_fix（220，39.9%）、Small_genome（108，18.4%）、Mycorrhizal（227，15.4%）依次递减。
+- **宿主属丰度–richness 强正相关**：4 组 Spearman rho = 0.675–0.916（全 P < 1e-15）——宿主属携带的组内属越多，组相对丰度越高。richness 最高的宿主蓄水池：Gossypium（Anaerobic 218 属）、Achnatherum（174）、Brassica（133）；Myco 组 Achnatherum（31）、Nitrogen_fix 组 Brassica（22）、Small_genome 组 Gossypium（24）。
+- **组内属流行度结构分化**：Anaerobic / Nitrogen_fix 各具 2 个 Core 属（高流行+高丰度）——Anaerobic 的 Incertae Sedis（Bacillota，61.3% 流行、0.57% 平均丰度）与 Clostridium；Nitrogen_fix 的 Bradyrhizobium（55.9%）、Mesorhizobium（50.5%）。Myco / Small_genome 无 Core 属，专才属占比较高（21/44 与 22/46），呈特异宿主偏好。
+- **GOS 策略**：4 组均无强通才（Myco 0 / Anaerobic 2 / Nfix 3 / Small_genome 0）；专才占比以 Anaerobic（183/345）与 Small_genome（21/46）最高，与"特殊功能群多为宿主特异富集"一致。
+- **宿主目层面无显著分化**：属×宿主目 KW 在 FDR<0.05 下均无显著；宿主目级 KW 亦多不显著（Myco P=0.051 边缘）——差异主要体现在宿主属层级。
+
+---
+
+# 13. 属级合并分析与 β 多样性/聚类（merged_analysis，explore2 思路）
+
+目的：在**属级（Genus 层级，CSS 归一化）整表**水平重做种子微生物 β 多样性与聚类分析，与 §7 的 ASV/区段级结果互补，回答同一科学问题（宿主种类是否为主导因素、宿主系统发育与群落结构是否相关）在属级聚合口径下的稳健性。
+
+- **分析对象**：`standard_merge/genus_{16s,its}_asvtab.txt`（CSS 归一化属级丰度表，行=属、首列字面 `Genus`、列=样本 X 前缀）。
+- **样本→宿主物种聚合**（§13.2 第 1 步）：相对丰度 `rel = X/colSums(X)` → 样本级 0-1（`rel > 0.01%` → 1）→ 按宿主物种用 **GOS top-T 代表法**合并（复用 `scripts/R/gos_analysis.R` 的 `gos_presence_merge`：每物种 T = mean（n<10）或 AD 检验 mean/median（n≥10），按属检出率降序取前 T 置 1）；另按平均（rowMeans）合并出 Species×Genus 相对丰度矩阵（行和≈1）。
+- **Genus 级统计**（第 2 步）：`n_hosts`（宿主物种数）/ `n_hostg`（0-1 矩阵先按宿主属 OR 合并后计数）/ 平均相对丰度，top-25 n_hostg 簇状柱状图（双 y 轴）。
+- **β 多样性**（第 3-4 步，整表单位）：16S 全表 / ITS 全表 Bray-Curtis → `adonis2(bray ~ Region + Genus + Country + extract, by="margin", N=999)`（Region 为新增因子）→ PCoA 组合图（16S+ITS 共享宿主 Order 图例，配色与拼图逻辑对齐 `scripts/R/beta_pcoa_adonis.R`）+ 边际 R² 柱状图 + varpart 4 组分数表 + 3 组 Venn。
+- **7.4.1 复刻**（第 4 步）：物种级平均 Bray ↔ 宿主系统发育树 cophenetic 距离的 Mantel / MRM / dbRDA。
+- **T=0 聚类**（第 3 步服务器 / 第 5 步本地）：8 方法（ward.D/ward.D2/single/complete/average/mcquitty/median/centroid）× k=2..400 silhouette 网格 + 全网格 ARI vs 宿主 Order/Family/Genus/species 四层级；minK / bestARI 环形聚类树。
+- **运算成本**：bray / adonis2 / t0_grid 计算量大（服务器 256 核数小时），由 `explore2_beta_server.R` 在 `seed_meta_server` 完成并回传；本地脚本以**检查点方式**直接复用 `result/merged_analysis/{rds,result_table}` 既有结果，不重复计算（产物已存在则跳过）。
+- **作图**：全英文；配色用 §6.1 色板（PAL1/PAL2）；作图排除 `Unassigned` / `Incertae Sedis`（非有效属注释）。
+- **镜像脚本**：scripts/R/explore2_{species_aggregate,genus_occurrence,beta_server,beta_local,cluster_local}.R（独立运行版本，二者需保持同步）。完整口径与服务器部署命令见 `result/merged_analysis/explore2/README.md`。
+
+## 13.1 环境与配置
+
+```{r e2-setup}
+# 结果表 / 图输出目录（脚本内由 BASE_DIR 环境变量覆盖，默认 D:/seed_meta_new/Downstream_analysis）
+Sys.setenv(BASE_DIR = "D:/seed_meta_new/Downstream_analysis")
+E2_DIR <- file.path(Sys.getenv("BASE_DIR"), "result/merged_analysis")
+E2_TAB <- file.path(E2_DIR, "result_table"); E2_FIG <- file.path(E2_DIR, "result_figure")
+E2_RDS <- file.path(E2_DIR, "rds")
+for (d in c(E2_TAB, E2_FIG, E2_RDS))
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+# 聚类树图按数据集动态定位（minK / bestARI 两张；参数随数据可能变化，避免硬编码文件名）
+e2_tree_files <- function(dom) {
+  fs <- list.files(E2_FIG, pattern = sprintf("^cluster_tree_t0_%s_.*_(minK|bestARI)\\.jpg$", dom),
+                   full.names = TRUE)
+  fs[order(basename(fs))]
+}
+```
+
+## 13.2 运行分析（结果表 + 图）
+
+### 13.2.1 服务器端（bray / adonis2 / T=0 网格）——仅首次需要
+
+```{r e2-run-server-doc, eval=FALSE}
+# bray / adonis2 / t0_grid 计算量大，在服务器（seed_meta_server，conda env amplicon）运行一次并回传：
+#   scp scripts/R/explore2_beta_server.R \
+#       seed_meta_server:/home/zouhao/wzl/seed_meta_new/Downstrdam_amalysis/result/merged_analysis/
+#   ssh seed_meta_server 'cd .../result/merged_analysis && \
+#       conda activate amplicon && nohup Rscript explore2_beta_server.R > beta_run.log 2>&1 &'
+#   完成标记：grep -E "ALL DONE|Execution halted|step failed" beta_run.log
+#   回传：scp -r seed_meta_server:.../merged_analysis/{rds,result_table} .
+# 产物（result/merged_analysis/ 下，本地脚本读取复用）：
+#   rds/bray_dist_{16s,its}.rds、result_table/adonis2_{16s,its}.tsv、rds/adonis2_{16s,its}.rds、
+#   rds/t0_grid_{16s,its}.rds
+```
+
+### 13.2.2 本地四步（01 聚合 → 02 统计 → 04 β → 05 聚类）
+
+```{r e2-run-species}
+source("scripts/R/explore2_species_aggregate.R")
+```
+
+```{r e2-run-occurrence}
+source("scripts/R/explore2_genus_occurrence.R")
+```
+
+```{r e2-run-beta}
+source("scripts/R/explore2_beta_local.R")
+```
+
+```{r e2-run-cluster}
+source("scripts/R/explore2_cluster_local.R")
+```
+
+## 13.3 结果表
+
+```{r e2-tab-species}
+e2_sp <- data.table::rbindlist(lapply(c("16s", "its"), function(dom) {
+  s <- data.table::fread(file.path(E2_TAB, sprintf("species_sample_n_%s.tsv", dom)))
+  data.table::data.table(dataset = dom, n_species = nrow(s),
+                         T_min = min(s$rep_T), T_median = as.integer(stats::median(s$rep_T)),
+                         T_max = max(s$rep_T),
+                         n_samp_min = min(s$n_samples), n_samp_max = max(s$n_samples))
+}))
+knitr::kable(e2_sp, digits = 0,
+             caption = "Species 聚合日志：宿主物种数、每物种代表属数 T（GOS top-T 法）分布、每物种样本数范围")
+```
+
+```{r e2-tab-genus}
+e2_go <- data.table::rbindlist(lapply(c("16s", "its"), function(dom) {
+  g <- data.table::fread(file.path(E2_TAB, sprintf("genus_occurrence_%s.tsv", dom)))
+  g[!Genus %in% c("Unassigned", "Incertae Sedis")][order(-n_hostg)][1:15,
+      .(dataset = dom, Genus, n_hosts, n_hostg, mean_rel_abund)]
+}))
+knitr::kable(e2_go, digits = 4,
+             caption = "Genus 级统计 Top15（按 n_hostg 降序；已排除 Unassigned/Incertae Sedis；恒有 n_hostg ≤ n_hosts）")
+```
+
+```{r e2-tab-mantel}
+e2_mm <- data.table::rbindlist(lapply(c("16s", "its"), function(dom)
+  data.table::fread(file.path(E2_TAB, sprintf("mantel_mrm_%s.tsv", dom)))))
+knitr::kable(e2_mm[, .(dataset, n_common_species, mantel_pearson_r, mantel_p,
+                       mrm_R2, mrm_p, dbrda_R2, dbrda_p)], digits = 3,
+             caption = "7.4.1 宿主系统发育 × 群落相异性：Mantel / MRM / dbRDA（物种级平均 Bray vs 宿主树 cophenetic 距离，N=999）")
+```
+
+```{r e2-tab-adonis}
+e2_ad <- data.table::rbindlist(lapply(c("16s", "its"), function(dom)
+  data.table::fread(file.path(E2_TAB, sprintf("adonis2_%s.tsv", dom)))))
+e2_ad <- e2_ad[Factor %in% c("Region", "Genus", "Country", "extract", "Residual")]
+e2_ad[, R2_pct := 100 * R2]
+knitr::kable(e2_ad[, .(dataset = Region_set, Factor, Df, R2_pct, P)], digits = 3,
+             caption = "7.4.3 adonis2 边际置换检验：bray ~ Region + Genus + Country + extract（by=margin，N=999）。宿主属（Genus）为主导因素。")
+```
+
+```{r e2-tab-vpa}
+e2_vp <- data.table::rbindlist(lapply(c("16s", "its"), function(dom) {
+  v <- data.table::fread(file.path(E2_TAB, sprintf("vpa_fractions_%s.tsv", dom)))
+  u <- v[1:4]; u[, Component := c("Region (unique)", "Genus (unique)", "Country (unique)", "extract (unique)")]
+  a <- v[Fraction %like% "= All"]; a[, Component := "All factors"]
+  data.table::rbindlist(list(u, a))[, .(dataset = Dataset, Component, Df, adj.R2)]
+}))
+knitr::kable(e2_vp, digits = 4,
+             caption = "varpart 四组变异分解（X1=Region, X2=Genus, X3=Country, X4=extract）：各组唯一贡献与全部因子合并 adj.R²")
+```
+
+```{r e2-tab-cluster}
+e2_cs <- data.table::fread(file.path(E2_TAB, "host_match_t0_summary.csv"))
+e2_cs <- e2_cs[method %in% c("ward.D", "ward.D2", "complete", "average", "mcquitty")]
+knitr::kable(e2_cs[, .(dataset, method, best_sil_k, best_sil, best_ari_genus_k, best_ari_genus)], digits = 3,
+             caption = "7.4.2 T=0 聚类网格：每方法最优 silhouette 参数与最高 ARI(genus) 参数（8 方法 × k=2..400，silhouette 内部质量）")
+e2_bg <- data.table::rbindlist(lapply(c("16s", "its"), function(dom) {
+  g <- readRDS(file.path(E2_RDS, sprintf("t0_grid_%s.rds", dom)))
+  b <- g$best_global
+  data.table::data.table(dataset = dom, method = b$method, k = b$k, silhouette = b$silhouette)
+}))
+knitr::kable(e2_bg, digits = 3, caption = "T=0 网格全局最优 silhouette（两数据集均为 average 法）")
+```
+
+## 13.4 图
+
+```{r e2-fig-genus-16s, out.width="100%", fig.cap="16S top-25 n_hostg 簇状柱状图：左轴 n_hostg / n_hosts（整数），右轴 log10 平均相对丰度（sec_axis 反变换刻度）。"}
+if (file.exists(file.path(E2_FIG, "genus_top25_16s.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "genus_top25_16s.jpg"))
+```
+
+```{r e2-fig-genus-its, out.width="100%", fig.cap="ITS top-25 n_hostg 簇状柱状图（同 16S）。"}
+if (file.exists(file.path(E2_FIG, "genus_top25_its.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "genus_top25_its.jpg"))
+```
+
+```{r e2-fig-mantel-16s, out.width="100%", fig.cap="7.4.1 16S：物种级平均 Bray vs 宿主系统发育距离散点（Mantel/MRM 摘要标注）+ dbRDA 排序（CAP1/CAP2）双面板。"}
+if (file.exists(file.path(E2_FIG, "mantel_mrm_16s.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "mantel_mrm_16s.jpg"))
+```
+
+```{r e2-fig-mantel-its, out.width="100%", fig.cap="7.4.1 ITS：同 16S 双面板。ITS（真菌）Mantel r 高于 16S（细菌）。"}
+if (file.exists(file.path(E2_FIG, "mantel_mrm_its.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "mantel_mrm_its.jpg"))
+```
+
+```{r e2-fig-pcoa, out.width="100%", fig.cap="7.4.3 PCoA 组合图（16S 左 | ITS 右，共享宿主 Order 图例）：面板右上角为 adonis2 四因子边际 R²/P 摘要；Order 配色用全局 color_map_flat.rds（缺色灰色兜底）。"}
+if (file.exists(file.path(E2_FIG, "pcoa_adonis_16s_its.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "pcoa_adonis_16s_its.jpg"))
+```
+
+```{r e2-fig-r2-16s, out.width="100%", fig.cap="7.4.3 16S 边际 R² 柱状图（Region/Genus/Country/extract）。"}
+if (file.exists(file.path(E2_FIG, "permanova_R2_16s.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "permanova_R2_16s.jpg"))
+```
+
+```{r e2-fig-r2-its, out.width="100%", fig.cap="7.4.3 ITS 边际 R² 柱状图。"}
+if (file.exists(file.path(E2_FIG, "permanova_R2_its.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "permanova_R2_its.jpg"))
+```
+
+```{r e2-fig-vpa-16s, out.width="100%", fig.cap="7.4.3 16S 3 组 Venn（Genus/Country/Extract，varpart adj.R² 分数）。"}
+if (file.exists(file.path(E2_FIG, "vpa_16s.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "vpa_16s.jpg"))
+```
+
+```{r e2-fig-vpa-its, out.width="100%", fig.cap="7.4.3 ITS 3 组 Venn（同 16S）。"}
+if (file.exists(file.path(E2_FIG, "vpa_its.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "vpa_its.jpg"))
+```
+
+```{r e2-fig-kcurve-16s, out.width="100%", fig.cap="7.4.2 16S T=0 网格 k 曲线（facet 8 方法）：灰=silhouette（内部质量），彩色=ARI vs 宿主 Order/Family/Genus/species 四层级，点=各线最优 k。"}
+if (file.exists(file.path(E2_FIG, "host_match_t0_16s.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "host_match_t0_16s.jpg"))
+```
+
+```{r e2-fig-kcurve-its, out.width="100%", fig.cap="7.4.2 ITS T=0 网格 k 曲线（同 16S）。"}
+if (file.exists(file.path(E2_FIG, "host_match_t0_its.jpg")))
+  knitr::include_graphics(file.path(E2_FIG, "host_match_t0_its.jpg"))
+```
+
+```{r e2-fig-tree-16s, out.width="100%", fig.cap="7.4.2 16S 聚类树（环形，minK 与 bestARI 各一棵）：枝色=簇（Top30 按大小），尖色=宿主属（Top30 按样本数），灰=其他。"}
+if (length(e2_tree_files("16s")) > 0)
+  knitr::include_graphics(e2_tree_files("16s"))
+```
+
+```{r e2-fig-tree-its, out.width="100%", fig.cap="7.4.2 ITS 聚类树（同 16S）。"}
+if (length(e2_tree_files("its")) > 0)
+  knitr::include_graphics(e2_tree_files("its"))
+```
+
+## 13.5 主要发现
+
+- **宿主属为属级整表的主导因素**：adonis2 边际 R² 16S **Genus 0.210** / ITS **Genus 0.226**（均 P=0.001）；Country 稳定贡献 ~0.05；新增 Region 因子显著但贡献小（16S 0.017 / ITS 0.007）；Residual 0.562/0.606 仍占大头——宿主属之外仍有大量地理与未测因素。
+- **宿主系统发育 × 群落相异性显著但弱相关**（7.4.1）：Mantel r = 16S 0.115 / ITS 0.216；MRM R² = 0.013 / 0.047；dbRDA R² = 0.057 / 0.075（全 P=0.001）。ITS（真菌）信号略强于 16S（细菌）。
+- **PCoA 前两轴解释率**：16S 15.8% + 7.6% = 23.4%；ITS 16.6% + 10.7% = 27.3%。
+- **T=0 聚类与宿主层级 ARI 整体偏弱（全部 < 0.22）**：最高 ARI(genus) 16S `ward.D2` k=49 **0.189**、ITS `ward.D2` k=39 **0.212**；最优 silhouette 16S `average` k=304 sil=0.296、ITS `average` k=2 sil=0.338。四层级最高 ARI（16S/ITS）：Order 0.129/0.128、Family 0.132/0.125、Genus 0.189/0.212、species 0.213/0.217——宿主属/物种层级略强于 Order/Family；`single`/`median`/`centroid` 法 ARI≈0（无效分割）。
+- **总评**：在属级整表水平，宿主信号对种子微生物 β 多样性**显著但有限**——宿主属边际 R²≈0.21–0.23（主导因素），Country ~0.05 次之，Region 新因子贡献小；聚类与宿主层级 ARI<0.22，群落组装仍受地理、区域与随机漂移等多因素共同驱动，与 ASV/区段级（§7.4）结论一致，属级聚合口径稳健。
+- **注释深度**：16S 三组 100% 注释到属；Mycorrhizal 仅 74%（26% 未到属者中 78% 可到科、全部可到门）——ITS 真菌注释是瓶颈，属级结论宜结合层级标签（_f/_c/_o/_p）解读。
